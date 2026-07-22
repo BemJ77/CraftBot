@@ -1,0 +1,87 @@
+local protocol = require("common.protocol")
+
+local network = {}
+
+local modemSide = nil
+
+local function findWirelessModem()
+    for _, name in ipairs(peripheral.getNames()) do
+        if peripheral.getType(name) == "modem" then
+            local modem = peripheral.wrap(name)
+
+            if modem
+                and modem.isWireless
+                and modem.isWireless() then
+                return name
+            end
+        end
+    end
+
+    return nil
+end
+
+function network.open()
+    modemSide = findWirelessModem()
+
+    if not modemSide then
+        return false, "Aucun modem sans fil detecte"
+    end
+
+    if not rednet.isOpen(modemSide) then
+        rednet.open(modemSide)
+    end
+
+    return true, modemSide
+end
+
+function network.send(receiverId, message)
+    if type(receiverId) ~= "number" then
+        return false, "ID destinataire invalide"
+    end
+
+    if type(message) ~= "table" then
+        return false, "Message invalide"
+    end
+
+    local sent = rednet.send(
+        receiverId,
+        message,
+        protocol.NAME
+    )
+
+    if not sent then
+        return false, "Envoi impossible"
+    end
+
+    return true
+end
+
+function network.broadcast(message)
+    if type(message) ~= "table" then
+        return false, "Message invalide"
+    end
+
+    rednet.broadcast(
+        message,
+        protocol.NAME
+    )
+
+    return true
+end
+
+function network.receive(timeout)
+    local senderId, message, receivedProtocol =
+        rednet.receive(protocol.NAME, timeout)
+
+    if not senderId then
+        return nil, nil
+    end
+
+    return senderId, message, receivedProtocol
+end
+
+function network.getModemSide()
+    return modemSide
+end
+
+return network

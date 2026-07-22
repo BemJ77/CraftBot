@@ -1,0 +1,202 @@
+local logger = {}
+
+local LOG_FILE = "/craftbot/log/craftbot.log"
+
+logger.DEBUG = true
+logger.indentLevel = 0
+logger.stepNumber = 0
+
+local function ensureLogDirectory()
+    local directory = fs.getDir(LOG_FILE)
+
+    if directory ~= ""
+        and not fs.exists(directory) then
+
+        fs.makeDir(directory)
+    end
+end
+
+local function getIndent()
+    return string.rep("    ", logger.indentLevel)
+end
+
+local function stringify(...)
+    local values = {...}
+    local parts = {}
+
+    for index, value in ipairs(values) do
+        parts[index] = tostring(value)
+    end
+
+    return table.concat(parts, " ")
+end
+
+local function output(line)
+    ensureLogDirectory()
+
+    local file = fs.open(LOG_FILE, "a")
+
+    if file then
+        file.writeLine(line)
+        file.close()
+    end
+
+    if logger.DEBUG then
+        print(line)
+    end
+end
+
+local function write(level, ...)
+    local message = stringify(...)
+    local indent = getIndent()
+
+    output(
+        string.format(
+            "%s[%s] %s",
+            indent,
+            level,
+            message
+        )
+    )
+end
+
+local function separator(character, length)
+    character = character or "="
+    length = length or 48
+
+    output(
+        getIndent()
+        .. string.rep(character, length)
+    )
+end
+
+function logger.clear()
+    if fs.exists(LOG_FILE) then
+        fs.delete(LOG_FILE)
+    end
+end
+
+function logger.info(...)
+    write("INFO", ...)
+end
+
+function logger.warning(...)
+    write("WARN", ...)
+end
+
+function logger.error(...)
+    write("ERROR", ...)
+end
+
+function logger.debug(...)
+    if logger.DEBUG then
+        write("DEBUG", ...)
+    end
+end
+
+function logger.push()
+    logger.indentLevel =
+        logger.indentLevel + 1
+end
+
+function logger.pop()
+    logger.indentLevel =
+        math.max(logger.indentLevel - 1, 0)
+end
+
+function logger.craftStart(recipeName, isSubCraft)
+    logger.stepNumber = 0
+
+    separator()
+
+    if isSubCraft then
+        output(
+            getIndent()
+            .. "[AUTOCRAFT] "
+            .. tostring(recipeName)
+        )
+    else
+        output(
+            getIndent()
+            .. "[CRAFT] "
+            .. tostring(recipeName)
+        )
+    end
+
+    separator()
+end
+
+function logger.craftEnd(recipeName, success)
+    separator("-")
+
+    if success then
+        output(
+            getIndent()
+            .. "[TERMINE] "
+            .. tostring(recipeName)
+        )
+    else
+        output(
+            getIndent()
+            .. "[ECHEC] "
+            .. tostring(recipeName)
+        )
+    end
+
+    separator()
+end
+
+function logger.step(message)
+    logger.stepNumber =
+        logger.stepNumber + 1
+
+    output(
+        string.format(
+            "%s[%d] %s",
+            getIndent(),
+            logger.stepNumber,
+            tostring(message)
+        )
+    )
+end
+
+function logger.ok(message)
+    if message then
+        output(
+            getIndent()
+            .. "    OK - "
+            .. tostring(message)
+        )
+    else
+        output(
+            getIndent()
+            .. "    OK"
+        )
+    end
+end
+
+function logger.fail(message)
+    output(
+        getIndent()
+        .. "    ERREUR - "
+        .. tostring(message)
+    )
+end
+
+function logger.warn(message)
+    output(
+        getIndent()
+        .. "    ATTENTION - "
+        .. tostring(message)
+    )
+end
+
+function logger.detail(...)
+    output(
+        getIndent()
+        .. "    "
+        .. stringify(...)
+    )
+end
+
+return logger

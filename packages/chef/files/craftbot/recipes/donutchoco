@@ -1,0 +1,23 @@
+local items = require("items")
+ 
+return {
+    id = "donutchoco",
+    label = "Donut au Chocolat",
+ 
+    visible = true,
+    category = "dessert",
+
+    output = items.donutchoco,
+    outputCount = 1,
+ 
+    ingredients = {
+        [1] = items.pot,
+        [2] = items.huile,
+        [3] = items.cacao,
+        [5] = items.pate,
+    },
+
+	returns = {
+        items.pot
+    }
+}

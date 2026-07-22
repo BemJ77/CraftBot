@@ -1,0 +1,23 @@
+local items = require("items")
+ 
+return {
+    id = "frite",
+    label = "frite",
+ 
+    visible = true,
+    category = "side",
+
+    output = items.frite,
+    outputCount = 1,
+ 
+    ingredients = {
+        [1] = items.pot,
+        [2] = items.patate,
+        [3] = items.huile,
+        [5] = items.sel,
+    },
+
+	returns = {
+        items.pot
+    }
+}

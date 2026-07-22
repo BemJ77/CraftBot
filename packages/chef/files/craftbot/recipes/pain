@@ -1,0 +1,17 @@
+local items = require("items")
+
+return {
+    id = "pain",
+    label = "pain",
+
+    visible = false,
+    
+    output = items.pain,
+    outputCount = 1,
+
+    ingredients = {
+        [1] = items.ble,
+        [2] = items.ble,
+        [3] = items.ble,
+    }
+}

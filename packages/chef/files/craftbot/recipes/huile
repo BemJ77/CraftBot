@@ -1,0 +1,20 @@
+local items = require("items")
+ 
+return {
+    id = "huile",
+    label = "huile",
+ 
+    visible = false,
+    
+    output = items.huile,
+    outputCount = 2,
+ 
+    ingredients = {
+        [1] = items.roller,
+        [2] = items.salade,
+    },
+
+	returns = {
+        items.roller
+    }
+}

@@ -1,0 +1,448 @@
+local reservationManager = {}
+
+local reservations = {}
+local sequence = 0
+
+local function normalizeQuantity(quantity)
+    quantity = math.floor(tonumber(quantity) or 0)
+
+    if quantity < 0 then
+        return 0
+    end
+
+    return quantity
+end
+
+local function makeId()
+    sequence = sequence + 1
+    return "reservation-" .. tostring(sequence)
+end
+
+local function copyReservation(reservation)
+    if not reservation then
+        return nil
+    end
+
+    return {
+        id = reservation.id,
+        item = reservation.item,
+        quantity = reservation.quantity,
+        remaining = reservation.remaining,
+        orderId = reservation.orderId,
+        taskId = reservation.taskId,
+        ownerRecipe = reservation.ownerRecipe,
+        producerTaskId = reservation.producerTaskId,
+        status = reservation.status,
+        createdAt = reservation.createdAt,
+        updatedAt = reservation.updatedAt,
+        metadata = reservation.metadata
+    }
+end
+
+function reservationManager.clear()
+    reservations = {}
+    sequence = 0
+end
+
+function reservationManager.reserve(itemName, quantity, context)
+    context = type(context) == "table" and context or {}
+    quantity = normalizeQuantity(quantity)
+
+    if type(itemName) ~= "string" or itemName == "" then
+        return nil, "Nom d'objet invalide"
+    end
+
+    if quantity <= 0 then
+        return nil, "Quantite de reservation invalide"
+    end
+
+    local now = os.epoch("utc") / 1000
+    local reservation = {
+        id = makeId(),
+        item = itemName,
+        quantity = quantity,
+        remaining = quantity,
+        orderId = context.orderId,
+        taskId = context.taskId,
+        ownerRecipe = context.ownerRecipe,
+        producerTaskId = context.producerTaskId,
+        status = "reserved",
+        createdAt = now,
+        updatedAt = now,
+        metadata = context.metadata
+    }
+
+    reservations[reservation.id] = reservation
+    return copyReservation(reservation)
+end
+
+function reservationManager.get(reservationId)
+    return copyReservation(reservations[reservationId])
+end
+
+function reservationManager.list(filter)
+    filter = type(filter) == "table" and filter or {}
+    local result = {}
+
+    for _, reservation in pairs(reservations) do
+        local matches = true
+
+        if filter.orderId ~= nil
+            and reservation.orderId ~= filter.orderId then
+            matches = false
+        end
+
+        if filter.taskId ~= nil
+            and reservation.taskId ~= filter.taskId then
+            matches = false
+        end
+
+        if filter.item ~= nil
+            and reservation.item ~= filter.item then
+            matches = false
+        end
+
+        if filter.status ~= nil
+            and reservation.status ~= filter.status then
+            matches = false
+        end
+
+        if matches then
+            table.insert(result, copyReservation(reservation))
+        end
+    end
+
+    table.sort(
+        result,
+        function(a, b)
+            return tostring(a.id) < tostring(b.id)
+        end
+    )
+
+    return result
+end
+
+function reservationManager.reservedQuantity(itemName, exceptContext)
+    exceptContext = type(exceptContext) == "table" and exceptContext or {}
+    local total = 0
+
+    for _, reservation in pairs(reservations) do
+        if reservation.item == itemName
+            and reservation.status == "reserved"
+            and reservation.remaining > 0 then
+
+            local excluded = false
+
+            if exceptContext.orderId ~= nil
+                and reservation.orderId == exceptContext.orderId then
+                excluded = true
+            end
+
+            if exceptContext.taskId ~= nil
+                and reservation.taskId == exceptContext.taskId then
+                excluded = true
+            end
+
+            if not excluded then
+                total = total + reservation.remaining
+            end
+        end
+    end
+
+    return total
+end
+
+function reservationManager.availableQuantity(
+    itemName,
+    physicalStock,
+    context
+)
+    physicalStock = normalizeQuantity(physicalStock)
+    local reservedByOthers =
+        reservationManager.reservedQuantity(itemName, context)
+
+    return math.max(0, physicalStock - reservedByOthers)
+end
+
+function reservationManager.consume(reservationId, quantity)
+    local reservation = reservations[reservationId]
+
+    if not reservation then
+        return nil, "Reservation introuvable"
+    end
+
+    if reservation.status ~= "reserved" then
+        return nil, "Reservation non consommable : "
+            .. tostring(reservation.status)
+    end
+
+    quantity = normalizeQuantity(quantity)
+
+    if quantity <= 0 then
+        return nil, "Quantite a consommer invalide"
+    end
+
+    if quantity > reservation.remaining then
+        return nil, "Quantite superieure au reste reserve"
+    end
+
+    reservation.remaining = reservation.remaining - quantity
+    reservation.updatedAt = os.epoch("utc") / 1000
+
+    if reservation.remaining <= 0 then
+        reservation.remaining = 0
+        reservation.status = "consumed"
+    end
+
+    return copyReservation(reservation)
+end
+
+
+function reservationManager.consumeForOrder(orderId, itemName, quantity)
+    quantity = normalizeQuantity(quantity)
+
+    if quantity <= 0 then
+        return 0, nil
+    end
+
+    local remainingToConsume = quantity
+    local consumed = 0
+    local candidates = {}
+
+    for _, reservation in pairs(reservations) do
+        if reservation.orderId == orderId
+            and reservation.item == itemName
+            and reservation.status == "reserved"
+            and reservation.remaining > 0 then
+            table.insert(candidates, reservation)
+        end
+    end
+
+    table.sort(
+        candidates,
+        function(a, b)
+            return tostring(a.id) < tostring(b.id)
+        end
+    )
+
+    for _, reservation in ipairs(candidates) do
+        if remainingToConsume <= 0 then
+            break
+        end
+
+        local amount = math.min(
+            reservation.remaining,
+            remainingToConsume
+        )
+
+        reservation.remaining = reservation.remaining - amount
+        reservation.updatedAt = os.epoch("utc") / 1000
+        remainingToConsume = remainingToConsume - amount
+        consumed = consumed + amount
+
+        if reservation.remaining <= 0 then
+            reservation.remaining = 0
+            reservation.status = "consumed"
+        end
+    end
+
+    return consumed, nil
+end
+
+
+
+function reservationManager.reservedQuantityForTask(
+    orderId,
+    taskId,
+    itemName
+)
+    local total = 0
+
+    for _, reservation in pairs(reservations) do
+        if reservation.orderId == orderId
+            and tostring(reservation.taskId or "")
+                == tostring(taskId or "")
+            and reservation.item == itemName
+            and reservation.status == "reserved"
+            and reservation.remaining > 0 then
+            total = total + reservation.remaining
+        end
+    end
+
+    return total
+end
+
+function reservationManager.totalReservedQuantity(itemName)
+    local total = 0
+
+    for _, reservation in pairs(reservations) do
+        if reservation.item == itemName
+            and reservation.status == "reserved"
+            and reservation.remaining > 0 then
+            total = total + reservation.remaining
+        end
+    end
+
+    return total
+end
+
+function reservationManager.reservedQuantityForOthers(
+    itemName,
+    ownerTaskId
+)
+    local total = 0
+
+    for _, reservation in pairs(reservations) do
+        if reservation.item == itemName
+            and reservation.status == "reserved"
+            and reservation.remaining > 0
+            and tostring(reservation.taskId or "")
+                ~= tostring(ownerTaskId or "") then
+            total = total + reservation.remaining
+        end
+    end
+
+    return total
+end
+
+function reservationManager.consumeForTask(
+    orderId,
+    taskId,
+    itemName,
+    quantity
+)
+    quantity = normalizeQuantity(quantity)
+
+    if quantity <= 0 then
+        return 0, nil
+    end
+
+    local remainingToConsume = quantity
+    local consumed = 0
+    local candidates = {}
+
+    for _, reservation in pairs(reservations) do
+        if reservation.orderId == orderId
+            and tostring(reservation.taskId or "")
+                == tostring(taskId or "")
+            and reservation.item == itemName
+            and reservation.status == "reserved"
+            and reservation.remaining > 0 then
+            table.insert(candidates, reservation)
+        end
+    end
+
+    table.sort(
+        candidates,
+        function(a, b)
+            return tostring(a.id) < tostring(b.id)
+        end
+    )
+
+    for _, reservation in ipairs(candidates) do
+        if remainingToConsume <= 0 then
+            break
+        end
+
+        local amount = math.min(
+            reservation.remaining,
+            remainingToConsume
+        )
+
+        reservation.remaining = reservation.remaining - amount
+        reservation.updatedAt = os.epoch("utc") / 1000
+        remainingToConsume = remainingToConsume - amount
+        consumed = consumed + amount
+
+        if reservation.remaining <= 0 then
+            reservation.remaining = 0
+            reservation.status = "consumed"
+        end
+    end
+
+    return consumed, nil
+end
+
+function reservationManager.releaseTask(
+    orderId,
+    taskId,
+    reason
+)
+    local released = 0
+
+    for _, reservation in pairs(reservations) do
+        if reservation.orderId == orderId
+            and tostring(reservation.taskId or "")
+                == tostring(taskId or "")
+            and reservation.status == "reserved" then
+
+            reservation.status = "released"
+            reservation.updatedAt = os.epoch("utc") / 1000
+            reservation.metadata = reservation.metadata or {}
+            reservation.metadata.releaseReason = reason
+            released = released + 1
+        end
+    end
+
+    return released
+end
+
+function reservationManager.release(reservationId, reason)
+    local reservation = reservations[reservationId]
+
+    if not reservation then
+        return nil, "Reservation introuvable"
+    end
+
+    if reservation.status == "reserved" then
+        reservation.status = "released"
+        reservation.updatedAt = os.epoch("utc") / 1000
+        reservation.metadata = reservation.metadata or {}
+        reservation.metadata.releaseReason = reason
+    end
+
+    return copyReservation(reservation)
+end
+
+function reservationManager.releaseOrder(orderId, reason)
+    local released = 0
+
+    for _, reservation in pairs(reservations) do
+        if reservation.orderId == orderId
+            and reservation.status == "reserved" then
+            reservation.status = "released"
+            reservation.updatedAt = os.epoch("utc") / 1000
+            reservation.metadata = reservation.metadata or {}
+            reservation.metadata.releaseReason = reason
+            released = released + 1
+        end
+    end
+
+    return released
+end
+
+function reservationManager.summary(orderId)
+    local summary = {
+        total = 0,
+        reserved = 0,
+        consumed = 0,
+        released = 0,
+        items = {}
+    }
+
+    for _, reservation in pairs(reservations) do
+        if orderId == nil or reservation.orderId == orderId then
+            summary.total = summary.total + 1
+            summary[reservation.status] =
+                (summary[reservation.status] or 0) + 1
+
+            summary.items[reservation.item] =
+                (summary.items[reservation.item] or 0)
+                + reservation.remaining
+        end
+    end
+
+    return summary
+end
+
+return reservationManager

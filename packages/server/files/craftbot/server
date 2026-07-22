@@ -1,0 +1,1808 @@
+local protocol = require("common.protocol")
+local network = require("common.network")
+local reservationManager = require("reservationManager")
+
+local SERVER_VERSION = "7.1.1"
+-- V5.4 : 20 secondes était trop court avec plusieurs coroutines,
+-- le chargement de chunks ou un serveur Minecraft momentanément ralenti.
+-- V6.1 : marge large pour les ralentissements Minecraft,
+-- sauvegardes du monde et chargements de chunks.
+local HEARTBEAT_TIMEOUT = 180
+local HEARTBEAT_WARNING = 90
+local TASK_TIMEOUT = 180
+local REFRESH_INTERVAL = 0.35
+local MAX_LOGS = 7
+
+local clients = {}
+local orders = {}
+local orderSequence = 0
+local recipeCache = nil
+local recipeCatalog = nil
+local recipeById = {}
+local recipeByOutput = {}
+
+-- Autorisations d'export en attente de confirmation.
+-- Elles empêchent deux Chefs d'obtenir simultanément une autorisation
+-- fondée sur le même stock physique.
+local exportGrants = {}
+local exportGrantSequence = 0
+-- V6 : un grant n'est plus une réservation de stock.
+-- Il ne sert que de verrou très court pendant l'appel AE2.
+local EXPORT_GRANT_TIMEOUT = 4
+local pendingRecipeBornes = {}
+local recipeRequestChefId = nil
+local running = true
+local dirty = true
+local heartbeatWarnings = {}
+
+local nativeTerm = term.current()
+local monitor = nil
+
+local function now()
+    return os.epoch("utc") / 1000
+end
+
+local function clock()
+    return textutils.formatTime(os.time(), true)
+end
+
+local logs = {}
+
+local VISIBLE_LOG_LEVELS = {
+    CONNEXION = true,
+    DECONNEXION = true,
+    COMMANDE = true,
+    TERMINEE = true
+}
+
+local function addLog(level, message, color)
+    -- V5.4.1 : le tableau de bord affiche uniquement les événements
+    -- demandés. Les journaux techniques restent silencieux à l'écran.
+    if not VISIBLE_LOG_LEVELS[tostring(level)] then
+        return
+    end
+
+    table.insert(logs, {
+        time = clock(),
+        level = tostring(level),
+        message = tostring(message),
+        color = color or colors.white
+    })
+
+    while #logs > MAX_LOGS do
+        table.remove(logs, 1)
+    end
+
+    dirty = true
+end
+
+local function findMonitor()
+    for _, name in ipairs(peripheral.getNames()) do
+        if peripheral.getType(name) == "monitor" then
+            return peripheral.wrap(name)
+        end
+    end
+end
+
+local function truncate(text, width)
+    text = tostring(text or "")
+    if width <= 0 then return "" end
+    if #text <= width then return text end
+    if width <= 3 then return text:sub(1, width) end
+    return text:sub(1, width - 3) .. "..."
+end
+
+local function line(width, char)
+    term.setTextColor(colors.gray)
+    print(string.rep(char or "-", width))
+    term.setTextColor(colors.white)
+end
+
+local function countRole(role)
+    local total = 0
+    for _, client in pairs(clients) do
+        if client.role == role then total = total + 1 end
+    end
+    return total
+end
+
+local function getChefs()
+    local result = {}
+    for _, client in pairs(clients) do
+        if client.role == protocol.ROLE.CHEF then
+            table.insert(result, client)
+        end
+    end
+    table.sort(result, function(a, b)
+        return string.lower(a.name or "") < string.lower(b.name or "")
+    end)
+    return result
+end
+
+local function chefColor(status)
+    if status == "erreur" then return colors.red end
+    if status == "occupe" or status == "craft" then return colors.yellow end
+    return colors.lime
+end
+
+local function chefText(chef)
+    if chef.status == "erreur" then
+        return "ERREUR - " .. tostring(chef.error or "Erreur inconnue")
+    end
+    if chef.status == "occupe" or chef.status == "craft" then
+        return chef.currentCraft or "Fabrication en cours"
+    end
+    return "Disponible"
+end
+
+local function orderNumberText(id)
+    return string.format("#%03d", tonumber(id) or 0)
+end
+
+local function activeOrders()
+    local result = {}
+    for _, order in pairs(orders) do
+        if order.status ~= "finished" then table.insert(result, order) end
+    end
+    table.sort(result, function(a, b) return a.id < b.id end)
+    return result
+end
+
+local function orderProgress(order)
+    local completed = 0
+    local total = 0
+    local failed = false
+    local runningCount = 0
+    local waitingCount = 0
+
+    for _, task in ipairs(order.tasks) do
+        local taskTotal = math.max(1, tonumber(task.total) or tonumber(task.quantity) or 1)
+        local taskCurrent = math.max(0, tonumber(task.current) or 0)
+
+        total = total + taskTotal
+
+        if task.status == "ready" then
+            completed = completed + taskTotal
+        elseif task.status == "running" then
+            completed = completed + math.min(taskCurrent, taskTotal)
+            runningCount = runningCount + 1
+        elseif task.status == "failed" then
+            failed = true
+        else
+            waitingCount = waitingCount + 1
+        end
+    end
+
+    local percent = 0
+
+    if total > 0 then
+        percent = math.floor((completed / total) * 100 + 0.5)
+    end
+
+    if order.status == "finished" then
+        percent = 100
+    end
+
+    return percent, failed, runningCount, waitingCount
+end
+
+local function orderSummary(order)
+    local percent, failed, runningCount, waitingCount = orderProgress(order)
+
+    if failed or order.status == "failed" then
+        return "ERREUR"
+    end
+
+    if order.status == "finished" then
+        return "Terminee"
+    end
+
+    if runningCount > 0 then
+        return tostring(percent) .. "%"
+    end
+
+    if waitingCount > 0 then
+        return "En attente"
+    end
+
+    return tostring(percent) .. "%"
+end
+
+local function drawDashboard()
+    if not monitor then return end
+    local width, height = term.getSize()
+    term.setBackgroundColor(colors.black)
+    term.setTextColor(colors.white)
+    term.clear()
+    term.setCursorPos(1, 1)
+
+    line(width, "=")
+    local title = "CRAFTBOT SERVER"
+    term.setCursorPos(math.max(1, math.floor((width - #title) / 2) + 1), 2)
+    term.setTextColor(colors.lime)
+    write(title)
+    term.setCursorPos(1, 3)
+    line(width, "=")
+
+    print("")
+    term.setTextColor(colors.white)
+    write("Serveur : ")
+    term.setTextColor(colors.lime)
+    write("EN LIGNE")
+    term.setTextColor(colors.white)
+    print("   ID " .. os.getComputerID() .. "   " .. SERVER_VERSION)
+
+    term.setTextColor(colors.cyan)
+    write("Bornes " .. countRole(protocol.ROLE.TERMINAL))
+    term.setTextColor(colors.gray); write("  |  ")
+    term.setTextColor(colors.orange)
+    write("Chefs " .. countRole(protocol.ROLE.CHEF))
+    term.setTextColor(colors.gray); write("  |  ")
+    term.setTextColor(colors.purple)
+    write("Moniteurs " .. countRole(protocol.ROLE.MONITEUR))
+    term.setTextColor(colors.white); print("")
+
+    local reservationSummary = reservationManager.summary()
+    term.setTextColor(colors.lightBlue)
+    write("Reservations actives : ")
+    term.setTextColor(colors.white)
+    print(tostring(reservationSummary.reserved or 0))
+
+    line(width, "-")
+    print("CHEFS CONNECTES")
+
+    local chefs = getChefs()
+    if #chefs == 0 then
+        term.setTextColor(colors.gray); print("Aucun Chef connecte")
+    else
+        for _, chef in ipairs(chefs) do
+            local y = select(2, term.getCursorPos())
+            if y >= height - 9 then break end
+            local nameWidth = math.min(18, math.max(10, math.floor(width * 0.25)))
+            term.setTextColor(chefColor(chef.status))
+            write(truncate(chef.name, nameWidth))
+            term.setCursorPos(nameWidth + 3, y)
+            term.setTextColor(colors.white)
+            print(truncate(chefText(chef), width - nameWidth - 2))
+        end
+    end
+
+    line(width, "-")
+    print("COMMANDES")
+    local active = activeOrders()
+    if #active == 0 then
+        term.setTextColor(colors.gray); print("Aucune commande")
+    else
+        for _, order in ipairs(active) do
+            local y = select(2, term.getCursorPos())
+            if y >= height - MAX_LOGS - 3 then break end
+            local first = order.items[1]
+            local label = first and (first.recipe.label or first.recipe.id) or "Commande"
+            local quantity = first and first.quantity or 0
+            local text = orderNumberText(order.id) .. " " .. label .. " x" .. quantity
+            if #order.items > 1 then text = text .. " +" .. (#order.items - 1) end
+            term.setTextColor(order.status == "failed" and colors.red or colors.white)
+            write(truncate(text, math.max(20, width - 16)))
+            local status = orderSummary(order)
+            local x = math.max(1, width - #status + 1)
+            term.setCursorPos(x, y)
+            term.setTextColor(status == "ERREUR" and colors.red
+                or status == "En cours" and colors.yellow
+                or colors.gray)
+            print(status)
+        end
+    end
+
+    local y = select(2, term.getCursorPos())
+    if height - y >= 3 then
+        line(width, "-")
+        term.setTextColor(colors.white); print("ACTIVITE RECENTE")
+        local available = height - select(2, term.getCursorPos()) + 1
+        local first = math.max(1, #logs - available + 1)
+        for i = first, #logs do
+            local entry = logs[i]
+            term.setTextColor(colors.gray); write("[" .. entry.time .. "] ")
+            term.setTextColor(entry.color); write(entry.level .. " ")
+            term.setTextColor(colors.white)
+            print(truncate(entry.message, width - #entry.time - #entry.level - 4))
+        end
+    end
+    dirty = false
+end
+
+local function announce(receiverId)
+    local message = protocol.makeMessage(protocol.TYPE.SERVER_ANNOUNCE, {
+        id = os.getComputerID(),
+        name = os.getComputerLabel() or "CraftBot Server",
+        role = protocol.ROLE.SERVER,
+        serverVersion = SERVER_VERSION
+    })
+    if receiverId then return network.send(receiverId, message) end
+    return network.broadcast(message)
+end
+
+local function roleLabel(role)
+    if role == protocol.ROLE.TERMINAL then return "Borne" end
+    if role == protocol.ROLE.CHEF then return "Chef" end
+    if role == protocol.ROLE.MONITEUR then return "Moniteur" end
+    return tostring(role)
+end
+
+local function registerClient(senderId, data)
+    data = type(data) == "table" and data or {}
+
+    if not protocol.isValidRole(data.role)
+        or data.role == protocol.ROLE.SERVER then
+
+        network.send(
+            senderId,
+            protocol.makeMessage(
+                protocol.TYPE.CLIENT_REGISTERED,
+                {
+                    accepted = false,
+                    reason = "Role client invalide"
+                }
+            )
+        )
+        return
+    end
+
+    local previousClient = clients[senderId]
+    local existed = previousClient ~= nil
+
+    -- V6.3.3 : un Chef qui redémarre revient avec le même computer ID.
+    -- S'il possédait encore une tâche côté serveur, son processus local
+    -- l'a perdue. Elle doit donc être remise en attente immédiatement.
+    if previousClient
+        and previousClient.role == protocol.ROLE.CHEF
+        and previousClient.currentTask then
+
+        local interruptedTask = previousClient.currentTask
+
+        interruptedTask.status = "waiting"
+        interruptedTask.workerId = nil
+        interruptedTask.workerName = nil
+        interruptedTask.lastProgressAt = nil
+        interruptedTask.startedAt = nil
+        interruptedTask.retryCount =
+            (tonumber(interruptedTask.retryCount) or 0) + 1
+
+        -- Les réservations restent liées au taskId, mais les transactions
+        -- AE2 inachevées de l'ancien processus sont supprimées.
+        for grantId, grant in pairs(exportGrants) do
+            if grant.chefId == senderId then
+                exportGrants[grantId] = nil
+            end
+        end
+
+        addLog(
+            "DECONNEXION",
+            "Chef "
+                .. tostring(previousClient.name)
+                .. " : craft interrompu, tache remise en attente",
+            colors.red
+        )
+    end
+
+    local client = previousClient or {}
+
+    client.id = senderId
+    client.role = data.role
+    client.name = data.name or ("Computer " .. senderId)
+    client.version = data.clientVersion or "inconnue"
+    client.lastSeen = now()
+    client.connectedAt = client.lastSeen
+    heartbeatWarnings[senderId] = nil
+
+    -- Ne jamais réutiliser l'état du processus précédent.
+    client.status = data.status or "disponible"
+    client.currentCraft = data.currentCraft
+    client.error = data.error
+    client.currentTask = nil
+
+    clients[senderId] = client
+
+    network.send(
+        senderId,
+        protocol.makeMessage(
+            protocol.TYPE.CLIENT_REGISTERED,
+            {
+                accepted = true,
+                serverId = os.getComputerID(),
+                serverName =
+                    os.getComputerLabel()
+                    or "CraftBot Server",
+                serverVersion = SERVER_VERSION,
+                heartbeatInterval = 5
+            }
+        )
+    )
+
+    if not existed then
+        addLog(
+            "CONNEXION",
+            roleLabel(client.role)
+                .. " "
+                .. client.name
+                .. " (ID "
+                .. senderId
+                .. ")",
+            client.role == protocol.ROLE.CHEF
+                and colors.orange
+                or client.role == protocol.ROLE.TERMINAL
+                and colors.cyan
+                or colors.purple
+        )
+    else
+        addLog(
+            "CONNEXION",
+            roleLabel(client.role)
+                .. " "
+                .. client.name
+                .. " reconnecte (ID "
+                .. senderId
+                .. ")",
+            client.role == protocol.ROLE.CHEF
+                and colors.orange
+                or colors.cyan
+        )
+    end
+
+    if client.role == protocol.ROLE.MONITEUR then
+        sendActiveOrdersToMonitor(senderId)
+    end
+
+    -- maintenanceLoop appelle dispatchOrders chaque seconde.
+    dirty = true
+end
+
+local function heartbeat(senderId, data)
+    local client = clients[senderId]
+    if not client then
+        network.send(senderId, protocol.makeMessage(protocol.TYPE.CLIENT_REGISTERED, {
+            accepted = false, mustRegister = true, reason = "Client non enregistre"
+        }))
+        return
+    end
+    data = type(data) == "table" and data or {}
+    client.lastSeen = now()
+    heartbeatWarnings[senderId] = nil
+    if data.status then client.status = tostring(data.status) end
+    if data.currentCraft ~= nil then client.currentCraft = tostring(data.currentCraft) end
+    if data.error ~= nil then client.error = tostring(data.error) end
+    if client.status == "disponible" and not client.currentTask then
+        client.currentCraft = nil
+        client.error = nil
+    end
+    network.send(senderId, protocol.makeMessage(protocol.TYPE.HEARTBEAT_ACK, {
+        serverTime = now()
+    }))
+    dirty = true
+end
+
+local function disconnect(senderId, reason)
+    local client = clients[senderId]
+    if not client then return end
+
+    -- Une autorisation AE2 accordée à un Chef disparu ne doit pas
+    -- bloquer le stock jusqu'à son expiration normale.
+    for grantId, grant in pairs(exportGrants) do
+        if grant.chefId == senderId then
+            exportGrants[grantId] = nil
+        end
+    end
+
+    -- En cas de crash, la tâche revient en attente. Son taskId reste
+    -- identique : les réservations V5.3 restent donc utilisables par
+    -- le prochain Chef auquel la tâche sera attribuée.
+    if client.currentTask then
+        client.currentTask.status = "waiting"
+        client.currentTask.workerId = nil
+        client.currentTask.workerName = nil
+        client.currentTask.lastProgressAt = nil
+        client.currentTask.retryCount =
+            (tonumber(client.currentTask.retryCount) or 0) + 1
+    end
+
+    clients[senderId] = nil
+    heartbeatWarnings[senderId] = nil
+
+    addLog(
+        "DECONNEXION",
+        roleLabel(client.role) .. " " .. client.name
+            .. (reason and (" : " .. reason) or ""),
+        colors.red
+    )
+    dirty = true
+end
+
+local function findFreeChef()
+    for _, chef in ipairs(getChefs()) do
+        if chef.status == "disponible" and not chef.currentTask then
+            return chef
+        end
+    end
+end
+
+local function rebuildRecipeIndexes()
+    recipeById = {}
+    recipeByOutput = {}
+
+    for _, recipe in ipairs(recipeCatalog or {}) do
+        local recipeId = tostring(recipe.id or recipe.module or "")
+
+        if recipeId ~= "" then
+            recipeById[recipeId] = recipe
+
+            if recipe.module and tostring(recipe.module) ~= "" then
+                recipeById[tostring(recipe.module)] = recipe
+            end
+        end
+
+        if recipe.output and tostring(recipe.output) ~= "" then
+            recipeByOutput[tostring(recipe.output)] = recipe
+        end
+    end
+end
+
+local function ingredientCounts(recipe)
+    local counts = {}
+
+    for _, ingredient in ipairs(recipe.ingredients or {}) do
+        local itemName = ingredient.item
+
+        if itemName then
+            counts[itemName] = (counts[itemName] or 0) + 1
+        end
+    end
+
+    return counts
+end
+
+local function collectCraftPlan(
+    recipeId,
+    quantity,
+    phase,
+    plan,
+    visiting,
+    rootRecipeId,
+    rootLabel
+)
+    quantity = math.max(1, math.floor(tonumber(quantity) or 1))
+    phase = tonumber(phase) or 0
+    plan = plan or {}
+    visiting = visiting or {}
+
+    rootRecipeId = tostring(rootRecipeId or recipeId)
+    rootLabel = tostring(rootLabel or rootRecipeId)
+
+    local recipe = recipeById[tostring(recipeId)]
+
+    if not recipe then
+        local missingKey = tostring(recipeId)
+
+        plan[missingKey] = plan[missingKey] or {
+            recipe = {
+                id = missingKey,
+                module = missingKey,
+                label = missingKey,
+                outputCount = 1
+            },
+            quantity = 0,
+            phase = phase,
+            rootRecipeId = rootRecipeId,
+            rootLabel = rootLabel
+        }
+
+        plan[missingKey].quantity =
+            plan[missingKey].quantity + quantity
+        plan[missingKey].phase =
+            math.max(plan[missingKey].phase, phase)
+
+        return plan
+    end
+
+    local key = tostring(recipe.module or recipe.id)
+
+    plan[key] = plan[key] or {
+        recipe = recipe,
+        quantity = 0,
+        phase = phase,
+        rootRecipeId = rootRecipeId,
+        rootLabel = rootLabel
+    }
+
+    plan[key].quantity = plan[key].quantity + quantity
+    plan[key].phase = math.max(plan[key].phase, phase)
+
+    if visiting[key] then
+        return plan
+    end
+
+    visiting[key] = true
+
+    local counts = ingredientCounts(recipe)
+
+    for itemName, countPerCraft in pairs(counts) do
+        local dependency = recipeByOutput[itemName]
+
+        if dependency then
+            local requiredItems = countPerCraft * quantity
+            local outputCount = math.max(
+                1,
+                tonumber(dependency.outputCount) or 1
+            )
+            local dependencyCrafts =
+                math.ceil(requiredItems / outputCount)
+
+            collectCraftPlan(
+                dependency.module or dependency.id,
+                dependencyCrafts,
+                phase + 1,
+                plan,
+                visiting,
+                rootRecipeId,
+                rootLabel
+            )
+        end
+    end
+
+    visiting[key] = nil
+    return plan
+end
+
+local function addSplitTasks(order, planEntry)
+    local chefCount = math.max(1, countRole(protocol.ROLE.CHEF))
+    local quantity = math.max(1, math.floor(planEntry.quantity))
+    local pieces = math.min(quantity, chefCount)
+    local base = math.floor(quantity / pieces)
+    local remainder = quantity % pieces
+
+    for splitIndex = 1, pieces do
+        local taskQuantity = base + (splitIndex <= remainder and 1 or 0)
+        local recipe = planEntry.recipe
+
+        table.insert(
+            order.tasks,
+            {
+                id = tostring(order.id)
+                    .. "-"
+                    .. tostring(recipe.module or recipe.id)
+                    .. "-"
+                    .. tostring(planEntry.phase)
+                    .. "-"
+                    .. tostring(splitIndex),
+                recipe = {
+                    id = recipe.module or recipe.id,
+                    label = recipe.label or recipe.id,
+                    output = recipe.output,
+                    outputCount = recipe.outputCount or 1
+                },
+                quantity = taskQuantity,
+                status = "waiting",
+                current = 0,
+                total = taskQuantity,
+                phase = planEntry.phase,
+                rootRecipeId = planEntry.rootRecipeId,
+                rootLabel = planEntry.rootLabel,
+                workerId = nil,
+                workerName = nil,
+                error = nil
+            }
+        )
+    end
+end
+
+local function createTasks(order)
+    local planEntries = {}
+
+    for itemIndex, item in ipairs(order.items) do
+        local rootRecipeId =
+            tostring(item.recipe.id)
+        local rootLabel =
+            tostring(
+                item.recipe.label
+                or item.recipe.id
+            )
+
+        -- V7 : un plan séparé est créé pour chaque produit final.
+        -- Les sous-crafts peuvent ainsi conserver leur racine exacte.
+        local rootPlan = {}
+
+        collectCraftPlan(
+            item.recipe.id,
+            item.quantity,
+            0,
+            rootPlan,
+            {},
+            rootRecipeId,
+            rootLabel
+        )
+
+        for _, entry in pairs(rootPlan) do
+            entry.rootItemIndex = itemIndex
+            table.insert(planEntries, entry)
+        end
+    end
+
+    table.sort(
+        planEntries,
+        function(a, b)
+            if a.rootItemIndex ~= b.rootItemIndex then
+                return a.rootItemIndex < b.rootItemIndex
+            end
+
+            if a.phase == b.phase then
+                return tostring(a.recipe.label or a.recipe.id)
+                    < tostring(b.recipe.label or b.recipe.id)
+            end
+
+            return a.phase > b.phase
+        end
+    )
+
+    for _, entry in ipairs(planEntries) do
+        addSplitTasks(order, entry)
+    end
+
+    -- V5.3 : chaque produit intermédiaire est réservé à la tâche
+    -- exacte qui devra le consommer. Deux Chefs de la même commande
+    -- ne partagent donc plus automatiquement les mêmes réservations.
+    order.reservations = {}
+
+    for _, consumerTask in ipairs(order.tasks) do
+        local fullRecipe =
+            recipeById[tostring(consumerTask.recipe.id)]
+
+        if fullRecipe then
+            local counts = ingredientCounts(fullRecipe)
+
+            for itemName, countPerCraft in pairs(counts) do
+                local producerRecipe = recipeByOutput[itemName]
+
+                if producerRecipe then
+                    local requiredQuantity =
+                        math.max(
+                            1,
+                            tonumber(consumerTask.quantity) or 1
+                        )
+                        * countPerCraft
+
+                    local reservation, reservationError =
+                        reservationManager.reserve(
+                            itemName,
+                            requiredQuantity,
+                            {
+                                orderId = order.id,
+                                taskId = consumerTask.id,
+                                ownerRecipe =
+                                    tostring(consumerTask.recipe.id),
+                                producerTaskId =
+                                    tostring(
+                                        producerRecipe.module
+                                        or producerRecipe.id
+                                    ),
+                                metadata = {
+                                    consumerTaskId = consumerTask.id,
+                                    consumerRecipe =
+                                        consumerTask.recipe.id,
+                                    producerRecipe =
+                                        producerRecipe.module
+                                        or producerRecipe.id,
+                                    consumerPhase =
+                                        consumerTask.phase
+                                }
+                            }
+                        )
+
+                    if reservation then
+                        table.insert(
+                            order.reservations,
+                            reservation.id
+                        )
+                    else
+                        addLog(
+                            "RESERVATION",
+                            tostring(reservationError),
+                            colors.red
+                        )
+                    end
+                end
+            end
+        end
+    end
+end
+
+local function publicTasks(order)
+    local result = {}
+    for _, task in ipairs(order.tasks) do
+        table.insert(result, {
+            id = task.id,
+            recipe = task.recipe,
+            quantity = task.quantity,
+            status = task.status,
+            current = task.current,
+            total = task.total,
+            workerId = task.workerId,
+            workerName = task.workerName,
+            error = task.error,
+            phase = task.phase,
+            rootRecipeId = task.rootRecipeId,
+            rootLabel = task.rootLabel
+        })
+    end
+    return result
+end
+
+local function getOrderMonitors()
+    local result = {}
+
+    for _, client in pairs(clients) do
+        if client.role == protocol.ROLE.MONITEUR then
+            table.insert(result, client)
+        end
+    end
+
+    return result
+end
+
+local function orderPayload(order, message)
+    return {
+        orderId = order.id,
+        orderNumber = orderNumberText(order.id),
+        borneId = order.borneId,
+        status = order.status,
+        progress = orderProgress(order),
+        message = message or order.message,
+        createdAt = order.createdAt,
+        tasks = publicTasks(order)
+    }
+end
+
+local function sendOrderToMonitors(messageType, order, message)
+    local payload = orderPayload(order, message)
+
+    for _, monitorClient in ipairs(getOrderMonitors()) do
+        network.send(
+            monitorClient.id,
+            protocol.makeMessage(messageType, payload)
+        )
+    end
+end
+
+local function sendActiveOrdersToMonitor(monitorId)
+    for _, order in pairs(orders) do
+        if order.status ~= "finished"
+            and order.status ~= "failed"
+            and order.status ~= "cancelled" then
+
+            network.send(
+                monitorId,
+                protocol.makeMessage(
+                    protocol.TYPE.ORDER_ACCEPTED,
+                    orderPayload(order, order.message)
+                )
+            )
+        end
+    end
+end
+
+local function sendOrderUpdate(order, message)
+    sendOrderToMonitors(
+        protocol.TYPE.ORDER_UPDATE,
+        order,
+        message
+    )
+end
+
+local function finishOrderIfNeeded(order)
+    local anyFailed = false
+    for _, task in ipairs(order.tasks) do
+        if task.status == "failed" then anyFailed = true end
+        if task.status ~= "ready" and task.status ~= "failed" then return false end
+    end
+
+    order.status = anyFailed and "failed" or "finished"
+
+    if anyFailed then
+        local released = reservationManager.releaseOrder(
+            order.id,
+            "commande en erreur"
+        )
+
+        if released > 0 then
+            addLog(
+                "RESERVATION",
+                tostring(released)
+                    .. " reservation(s) liberee(s) pour "
+                    .. orderNumberText(order.id),
+                colors.orange
+            )
+        end
+    end
+
+    dirty = true
+
+    local messageType = anyFailed and protocol.TYPE.ORDER_FAILED
+        or protocol.TYPE.ORDER_FINISHED
+    sendOrderToMonitors(
+        messageType,
+        order,
+        anyFailed and (order.error or "Commande en erreur")
+            or "Toute la commande est prete"
+    )
+
+    addLog(anyFailed and "ERREUR" or "TERMINEE",
+        "Commande " .. orderNumberText(order.id),
+        anyFailed and colors.red or colors.lime)
+    return true
+end
+
+local function currentOrderPhase(order)
+    local highest = nil
+
+    for _, task in ipairs(order.tasks) do
+        if task.status == "waiting" or task.status == "running" then
+            local phase = tonumber(task.phase) or 0
+
+            if highest == nil or phase > highest then
+                highest = phase
+            end
+        end
+    end
+
+    return highest
+end
+
+local function phaseHasRunningTasks(order, phase)
+    for _, task in ipairs(order.tasks) do
+        if task.status == "running"
+            and (tonumber(task.phase) or 0) == phase then
+            return true
+        end
+    end
+
+    return false
+end
+
+local function dispatchOrders()
+    for _, order in ipairs(activeOrders()) do
+        if order.status ~= "failed" then
+            local activePhase = currentOrderPhase(order)
+
+            if activePhase ~= nil then
+                for _, task in ipairs(order.tasks) do
+                    if task.status == "waiting"
+                        and (tonumber(task.phase) or 0) == activePhase then
+
+                        local chef = findFreeChef()
+
+                        if not chef then
+                            break
+                        end
+
+                        local sent, sendError = network.send(
+                            chef.id,
+                            {
+                                type = protocol.TYPE.CRAFT_REQUEST,
+                                orderId = order.id,
+                                orderNumber = order.id,
+                                taskId = task.id,
+                                recipe = task.recipe.id,
+                                recipeLabel = task.recipe.label,
+                                quantity = task.quantity,
+                                phase = task.phase
+                            }
+                        )
+
+                        if sent then
+                            task.status = "running"
+    task.startedAt = task.startedAt or now()
+    task.lastProgressAt = now()
+                            task.workerId = chef.id
+                            task.workerName = chef.name
+                            chef.currentTask = task
+                            chef.status = "occupe"
+                            chef.currentCraft =
+                                orderNumberText(order.id)
+                                .. " "
+                                .. tostring(task.recipe.label or task.recipe.id)
+                                .. " x"
+                                .. tostring(task.quantity)
+
+                            order.status = "running"
+                            order.message =
+                                chef.name
+                                .. " prepare "
+                                .. tostring(task.recipe.label or task.recipe.id)
+
+                            sendOrderUpdate(order, order.message)
+                            dirty = true
+                        else
+                            task.status = "failed"
+                            task.error = tostring(sendError)
+                            order.error = task.error
+                            order.status = "failed"
+                            finishOrderIfNeeded(order)
+                        end
+                    end
+                end
+            end
+        end
+    end
+end
+
+local function createOrder(senderId, data)
+    local client = clients[senderId]
+    if not client or client.role ~= protocol.ROLE.TERMINAL then return end
+    data = type(data) == "table" and data or {}
+    if type(data.items) ~= "table" or #data.items == 0 then
+        network.send(senderId, protocol.makeMessage(protocol.TYPE.ORDER_FAILED, {
+            message = "Panier vide"
+        }))
+        return
+    end
+
+    if not recipeCatalog then
+        network.send(senderId, protocol.makeMessage(protocol.TYPE.ORDER_FAILED, {
+            message = "Catalogue des recettes non charge"
+        }))
+        return
+    end
+
+    orderSequence = orderSequence + 1
+    local order = {
+        id = orderSequence,
+        borneId = senderId,
+        items = data.items,
+        tasks = {},
+        status = "waiting",
+        createdAt = now(),
+        message = "Commande en attente"
+    }
+    createTasks(order)
+    orders[order.id] = order
+
+    network.send(senderId, protocol.makeMessage(protocol.TYPE.ORDER_ACCEPTED, {
+        orderId = order.id,
+        orderNumber = orderNumberText(order.id),
+        status = order.status,
+        message = "Commande acceptee",
+        tasks = publicTasks(order)
+    }))
+    sendOrderToMonitors(
+        protocol.TYPE.ORDER_ACCEPTED,
+        order,
+        "Commande acceptee"
+    )
+
+    addLog("COMMANDE", orderNumberText(order.id) .. " recue de " .. client.name,
+        colors.cyan)
+
+    local reservationSummary = reservationManager.summary(order.id)
+
+    if (reservationSummary.reserved or 0) > 0 then
+        addLog(
+            "RESERVATION",
+            tostring(reservationSummary.reserved)
+                .. " sous-produit(s) reserve(s) pour "
+                .. orderNumberText(order.id),
+            colors.lightBlue
+        )
+    end
+
+    dirty = true
+    dispatchOrders()
+end
+
+local function requestRecipes(senderId)
+    if recipeCache then
+        network.send(senderId, {
+            type = protocol.TYPE.RECIPES_RESPONSE,
+            success = true,
+            recipes = recipeCache
+        })
+        return
+    end
+
+    pendingRecipeBornes[senderId] = true
+    if recipeRequestChefId then return end
+
+    local chef = getChefs()[1]
+    if not chef then
+        network.send(senderId, {
+            type = protocol.TYPE.RECIPES_RESPONSE,
+            success = false,
+            error = "Aucun Chef connecte",
+            recipes = {}
+        })
+        pendingRecipeBornes[senderId] = nil
+        return
+    end
+
+    recipeRequestChefId = chef.id
+    network.send(chef.id, { type = protocol.TYPE.RECIPES_REQUEST })
+end
+
+local function receiveRecipes(senderId, message)
+    if senderId ~= recipeRequestChefId then return end
+    recipeRequestChefId = nil
+    if message.success and type(message.recipes) == "table" then
+        recipeCache = message.recipes
+
+        if type(message.catalog) == "table" then
+            recipeCatalog = message.catalog
+            rebuildRecipeIndexes()
+            addLog(
+                "RECETTES",
+                tostring(#recipeCatalog) .. " recettes chargees",
+                colors.lime
+            )
+        end
+    end
+    for borneId in pairs(pendingRecipeBornes) do
+        network.send(borneId, {
+            type = protocol.TYPE.RECIPES_RESPONSE,
+            success = message.success,
+            error = message.error,
+            recipes = message.recipes or {}
+        })
+    end
+    pendingRecipeBornes = {}
+end
+
+local function findTaskByChef(senderId)
+    local chef = clients[senderId]
+    if not chef then return nil, nil, nil end
+    local task = chef.currentTask
+    if not task then return chef, nil, nil end
+    for _, order in pairs(orders) do
+        for _, candidate in ipairs(order.tasks) do
+            if candidate == task then return chef, order, task end
+        end
+    end
+    return chef, nil, task
+end
+
+
+local function releaseTaskReservations(order, task, reason)
+    if not order or not task then
+        return 0
+    end
+
+    local released = reservationManager.releaseTask(
+        order.id,
+        task.id,
+        reason
+    )
+
+    if released > 0 then
+        addLog(
+            "RESERVATION",
+            tostring(released)
+                .. " reservation(s) liberee(s) pour "
+                .. tostring(task.id),
+            colors.orange
+        )
+    end
+
+    return released
+end
+
+local function handleChefProgress(senderId, message)
+    local chef, order, task = findTaskByChef(senderId)
+    if not chef or not order or not task then return end
+    task.current = tonumber(message.current) or task.current
+    task.total = tonumber(message.total) or task.total
+    order.message = message.message or order.message
+    sendOrderUpdate(order, order.message)
+    dirty = true
+end
+
+local function handleChefFinished(senderId, message)
+    local chef, order, task = findTaskByChef(senderId)
+    if not chef or not order or not task then return end
+
+    if message.success then
+        task.status = "ready"
+        task.current = task.quantity
+        task.total = task.quantity
+        chef.status = "disponible"
+        chef.currentCraft = nil
+        chef.error = nil
+    else
+        task.status = "failed"
+        task.error = message.error or "Erreur inconnue"
+        order.status = "failed"
+        order.error = task.error
+        chef.status = "erreur"
+        chef.error = task.error
+    end
+    chef.currentTask = nil
+    sendOrderUpdate(order, message.message or message.error)
+    finishOrderIfNeeded(order)
+    dispatchOrders()
+    dirty = true
+end
+
+
+local function exportGrantId()
+    exportGrantSequence = exportGrantSequence + 1
+    return "export-" .. tostring(exportGrantSequence)
+end
+
+local function cleanupExpiredExportGrants()
+    local currentTime = now()
+
+    for grantId, grant in pairs(exportGrants) do
+        if currentTime - grant.createdAt > EXPORT_GRANT_TIMEOUT then
+            exportGrants[grantId] = nil
+        end
+    end
+end
+
+local function activeLockedQuantityForOthers(
+    itemName,
+    chefId,
+    taskId
+)
+    cleanupExpiredExportGrants()
+
+    local total = 0
+
+    for _, grant in pairs(exportGrants) do
+        local sameOwner =
+            grant.chefId == chefId
+            and tostring(grant.taskId or "")
+                == tostring(taskId or "")
+
+        if grant.item == itemName and not sameOwner then
+            total = total + grant.quantity
+        end
+    end
+
+    return total
+end
+
+local function findReusableExportGrant(
+    chefId,
+    orderId,
+    taskId,
+    itemName,
+    quantity
+)
+    cleanupExpiredExportGrants()
+
+    for grantId, grant in pairs(exportGrants) do
+        if grant.chefId == chefId
+            and grant.orderId == orderId
+            and tostring(grant.taskId or "")
+                == tostring(taskId or "")
+            and grant.item == itemName
+            and grant.quantity == quantity then
+            return grantId, grant
+        end
+    end
+
+    return nil, nil
+end
+
+local function findOrderTaskForChef(chefId)
+    local chef = clients[chefId]
+
+    if not chef or chef.role ~= protocol.ROLE.CHEF then
+        return nil, nil, nil
+    end
+
+    local task = chef.currentTask
+
+    if not task then
+        return chef, nil, nil
+    end
+
+    for _, order in pairs(orders) do
+        for _, candidate in ipairs(order.tasks) do
+            if candidate == task then
+                return chef, order, task
+            end
+        end
+    end
+
+    return chef, nil, task
+end
+
+local function handleStockExportRequest(senderId, data)
+    local chef, order, task = findOrderTaskForChef(senderId)
+    local requestId = data.requestId
+    local itemName = tostring(data.item or "")
+    local requested = math.max(0, math.floor(tonumber(data.quantity) or 0))
+    local physicalStock =
+        math.max(0, math.floor(tonumber(data.physicalStock) or 0))
+
+    local function respond(
+        allowed,
+        reason,
+        grantId,
+        available,
+        retryable,
+        retryAfter
+    )
+        network.send(
+            senderId,
+            protocol.makeMessage(
+                protocol.TYPE.STOCK_EXPORT_RESPONSE,
+                {
+                    requestId = requestId,
+                    allowed = allowed,
+                    reason = reason,
+                    grantId = grantId,
+                    item = itemName,
+                    quantity = requested,
+                    available = available or 0,
+                    retryable = retryable == true,
+                    retryAfter = tonumber(retryAfter) or 0
+                }
+            )
+        )
+    end
+
+    if not chef or not order or not task then
+        respond(false, "Aucune tache active pour ce Chef")
+        return
+    end
+
+    if tonumber(data.orderId) ~= tonumber(order.id)
+        or tostring(data.taskId or "") ~= tostring(task.id or "") then
+        respond(false, "Contexte de commande invalide")
+        return
+    end
+
+    if itemName == "" or requested <= 0 then
+        respond(false, "Demande d'export invalide")
+        return
+    end
+
+    -- V6 : les réservations sont la source de vérité.
+    --
+    -- 1. La réservation indique si la tâche possède le droit de
+    --    consommer cet objet.
+    -- 2. Le grant ne représente aucun stock réservé : il verrouille
+    --    seulement l'export AE2 pendant quelques secondes.
+    -- 3. Un Chef n'est jamais bloqué par son propre grant.
+    -- 4. Un grant identique encore actif est réutilisé au lieu d'en
+    --    créer un second.
+    local ownReserved =
+        reservationManager.reservedQuantityForTask(
+            order.id,
+            task.id,
+            itemName
+        )
+
+    local totalReserved =
+        reservationManager.totalReservedQuantity(itemName)
+
+    local lockedByOthers =
+        activeLockedQuantityForOthers(
+            itemName,
+            senderId,
+            task.id
+        )
+
+    local physicalAvailable =
+        math.max(0, physicalStock - lockedByOthers)
+
+    local unreservedPhysical =
+        math.max(0, physicalStock - totalReserved)
+
+    local reservationRight =
+        math.min(ownReserved, physicalAvailable)
+
+    local freeRight =
+        math.min(unreservedPhysical, physicalAvailable)
+
+    local available =
+        math.max(reservationRight, freeRight)
+
+    if available < requested then
+        local blockedOnlyByTransaction =
+            lockedByOthers > 0
+            and ownReserved >= requested
+            and physicalStock >= requested
+
+        respond(
+            false,
+            "Stock utilisable insuffisant : "
+                .. tostring(available)
+                .. "/"
+                .. tostring(requested)
+                .. " (physique="
+                .. tostring(physicalStock)
+                .. ", reserve_tache="
+                .. tostring(ownReserved)
+                .. ", verrou_autres="
+                .. tostring(lockedByOthers)
+                .. ")",
+            nil,
+            available,
+            blockedOnlyByTransaction,
+            blockedOnlyByTransaction and 0.15 or 0
+        )
+        return
+    end
+
+    local reusableGrantId =
+        findReusableExportGrant(
+            senderId,
+            order.id,
+            task.id,
+            itemName,
+            requested
+        )
+
+    if reusableGrantId then
+        respond(true, nil, reusableGrantId, available)
+        return
+    end
+
+    local grantId = exportGrantId()
+
+    exportGrants[grantId] = {
+        id = grantId,
+        chefId = senderId,
+        orderId = order.id,
+        taskId = task.id,
+        item = itemName,
+        quantity = requested,
+        createdAt = now()
+    }
+
+    respond(true, nil, grantId, available)
+
+    addLog(
+        "EXPORT",
+        chef.name
+            .. " autorise : "
+            .. itemName
+            .. " x"
+            .. tostring(requested)
+            .. " pour "
+            .. orderNumberText(order.id),
+        colors.lightBlue
+    )
+end
+
+local function handleStockExportCommit(senderId, data)
+    local requestId = data.requestId
+    local grantId = tostring(data.grantId or "")
+    local grant = exportGrants[grantId]
+
+    local function acknowledge(success, reason, transferred)
+        network.send(
+            senderId,
+            protocol.makeMessage(
+                protocol.TYPE.STOCK_EXPORT_COMMITTED,
+                {
+                    requestId = requestId,
+                    success = success,
+                    reason = reason,
+                    grantId = grantId,
+                    transferred = transferred or 0
+                }
+            )
+        )
+    end
+
+    if not grant then
+        acknowledge(true, "Transaction deja liberee", 0)
+        return
+    end
+
+    if grant.chefId ~= senderId then
+        acknowledge(false, "Transaction appartenant a un autre Chef", 0)
+        return
+    end
+
+    local transferred =
+        math.max(0, math.floor(tonumber(data.transferred) or 0))
+    transferred = math.min(transferred, grant.quantity)
+
+    -- Libération atomique avant consommation de réservation.
+    exportGrants[grantId] = nil
+
+    if transferred > 0 then
+        reservationManager.consumeForTask(
+            grant.orderId,
+            grant.taskId,
+            grant.item,
+            transferred
+        )
+    end
+
+    acknowledge(true, nil, transferred)
+    dirty = true
+end
+
+
+local function cancelOrder(senderId, data)
+    local orderId = tonumber(data.orderId)
+    local order = orderId and orders[orderId] or nil
+
+    if not order then
+        network.send(
+            senderId,
+            protocol.makeMessage(
+                protocol.TYPE.ORDER_CANCELLED,
+                {
+                    success = false,
+                    orderId = orderId,
+                    reason = "Commande introuvable"
+                }
+            )
+        )
+        return
+    end
+
+    if order.borneId ~= senderId then
+        network.send(
+            senderId,
+            protocol.makeMessage(
+                protocol.TYPE.ORDER_CANCELLED,
+                {
+                    success = false,
+                    orderId = orderId,
+                    reason = "Cette borne ne possede pas la commande"
+                }
+            )
+        )
+        return
+    end
+
+    if order.status == "finished"
+        or order.status == "failed"
+        or order.status == "cancelled" then
+        network.send(
+            senderId,
+            protocol.makeMessage(
+                protocol.TYPE.ORDER_CANCELLED,
+                {
+                    success = false,
+                    orderId = orderId,
+                    reason = "Commande deja terminee"
+                }
+            )
+        )
+        return
+    end
+
+    order.status = "cancelled"
+    order.error = data.reason or "Annulee depuis la borne"
+
+    for _, task in ipairs(order.tasks or {}) do
+        if task.workerId and clients[task.workerId] then
+            local chef = clients[task.workerId]
+            chef.currentTask = nil
+            chef.status = "disponible"
+            chef.currentCraft = nil
+        end
+
+        task.status = "cancelled"
+        task.workerId = nil
+        task.workerName = nil
+
+        reservationManager.releaseTask(
+            order.id,
+            task.id,
+            "commande annulee"
+        )
+    end
+
+    reservationManager.releaseOrder(
+        order.id,
+        "commande annulee"
+    )
+
+    for grantId, grant in pairs(exportGrants) do
+        if grant.orderId == order.id then
+            exportGrants[grantId] = nil
+        end
+    end
+
+    network.send(
+        senderId,
+        protocol.makeMessage(
+            protocol.TYPE.ORDER_CANCELLED,
+            {
+                success = true,
+                orderId = order.id,
+                orderNumber = order.number,
+                message = "Commande annulee"
+            }
+        )
+    )
+
+    addLog(
+        "ANNULATION",
+        orderNumberText(order.id) .. " annulee",
+        colors.orange
+    )
+
+    dirty = true
+end
+
+local function checkTaskTimeouts(current)
+    for _, order in pairs(orders) do
+        if order.status ~= "finished"
+            and order.status ~= "failed"
+            and order.status ~= "cancelled" then
+
+            for _, task in ipairs(order.tasks or {}) do
+                if task.status == "running"
+                    and task.lastProgressAt
+                    and current - task.lastProgressAt > TASK_TIMEOUT then
+
+                    local workerId = task.workerId
+
+                    addLog(
+                        "TIMEOUT",
+                        tostring(task.id)
+                            .. " sans progression depuis "
+                            .. tostring(TASK_TIMEOUT)
+                            .. " s",
+                        colors.red
+                    )
+
+                    if workerId and clients[workerId] then
+                        disconnect(
+                            workerId,
+                            "tache sans progression"
+                        )
+                    else
+                        task.status = "waiting"
+                        task.workerId = nil
+                        task.workerName = nil
+                        task.lastProgressAt = nil
+                        task.retryCount =
+                            (tonumber(task.retryCount) or 0) + 1
+                    end
+                end
+            end
+        end
+    end
+end
+
+local function handleMessage(senderId, message)
+    if type(message) ~= "table" then return end
+
+    -- V6.1 : un heartbeat n'est pas la seule preuve de vie.
+    -- Progression, export, fin de tâche, demande de recette ou commande
+    -- actualisent également la présence du client.
+    local knownClient = clients[senderId]
+
+    if knownClient then
+        knownClient.lastSeen = now()
+        heartbeatWarnings[senderId] = nil
+    end
+
+    local messageType = message.type
+    local data = message.data or message
+
+    if messageType == protocol.TYPE.SERVER_DISCOVER then
+        announce(senderId)
+    elseif messageType == protocol.TYPE.CLIENT_REGISTER then
+        registerClient(senderId, data)
+    elseif messageType == protocol.TYPE.HEARTBEAT then
+        heartbeat(senderId, data)
+    elseif messageType == protocol.TYPE.CLIENT_GOODBYE then
+        disconnect(senderId, data.reason)
+    elseif messageType == protocol.TYPE.RECIPES_REQUEST then
+        requestRecipes(senderId)
+    elseif messageType == protocol.TYPE.RECIPES_RESPONSE then
+        receiveRecipes(senderId, message)
+    elseif messageType == protocol.TYPE.ORDER_CREATE then
+        createOrder(senderId, data)
+    elseif messageType == protocol.TYPE.ORDER_CANCEL then
+        cancelOrder(senderId, data)
+    elseif messageType == protocol.TYPE.RESERVATIONS_REQUEST then
+        network.send(
+            senderId,
+            protocol.makeMessage(
+                protocol.TYPE.RESERVATIONS_RESPONSE,
+                {
+                    reservations = reservationManager.list(
+                        {
+                            orderId = data.orderId,
+                            status = data.status
+                        }
+                    ),
+                    summary = reservationManager.summary(data.orderId)
+                }
+            )
+        )
+    elseif messageType == protocol.TYPE.STOCK_EXPORT_REQUEST then
+        handleStockExportRequest(senderId, data)
+    elseif messageType == protocol.TYPE.STOCK_EXPORT_COMMIT then
+        handleStockExportCommit(senderId, data)
+    elseif messageType == protocol.TYPE.PROGRESS then
+        handleChefProgress(senderId, message)
+    elseif messageType == protocol.TYPE.FINISHED then
+        handleChefFinished(senderId, message)
+    elseif messageType == protocol.TYPE.PING then
+        network.send(senderId, protocol.makeMessage(protocol.TYPE.PONG, {
+            serverId = os.getComputerID(), serverTime = now()
+        }))
+    end
+end
+
+local function networkLoop()
+    while running do
+        local senderId, message = network.receive(1)
+        if senderId then
+            local ok, err = pcall(handleMessage, senderId, message)
+            if not ok then addLog("ERREUR", tostring(err), colors.red) end
+        end
+    end
+end
+
+local function maintenanceLoop()
+    while running do
+        local current = now()
+        local expired = {}
+
+        for id, client in pairs(clients) do
+            local silence = current - client.lastSeen
+
+            if silence > HEARTBEAT_TIMEOUT then
+                table.insert(expired, id)
+            elseif silence > HEARTBEAT_WARNING
+                and not heartbeatWarnings[id] then
+
+                heartbeatWarnings[id] = true
+                addLog(
+                    "HEARTBEAT",
+                    client.name
+                        .. " silencieux depuis "
+                        .. tostring(math.floor(silence))
+                        .. " s",
+                    colors.orange
+                )
+            end
+        end
+
+        -- Ne pas supprimer une entrée du tableau pendant pairs().
+        for _, id in ipairs(expired) do
+            disconnect(id, "heartbeat expiré")
+        end
+
+        checkTaskTimeouts(current)
+        dispatchOrders()
+        sleep(1)
+    end
+end
+
+local function dashboardLoop()
+    while running do
+        if dirty then drawDashboard() end
+        sleep(REFRESH_INTERVAL)
+    end
+end
+
+local function main()
+    monitor = findMonitor()
+    if not monitor then printError("Aucun moniteur detecte"); return end
+    if monitor.setTextScale then monitor.setTextScale(0.5) end
+    term.redirect(monitor)
+
+    local opened, modemSide = network.open()
+    if not opened then term.redirect(nativeTerm); printError(modemSide); return end
+
+    addLog("OK", "Modem ouvert sur : " .. modemSide, colors.lime)
+    addLog("INFO", "En attente des Bornes, Chefs et Moniteurs...", colors.lightBlue)
+    drawDashboard()
+    announce()
+
+    parallel.waitForAny(networkLoop, maintenanceLoop, dashboardLoop)
+end
+
+local ok, err = pcall(main)
+term.redirect(nativeTerm)
+if not ok then printError("Erreur fatale du serveur : " .. tostring(err)) end

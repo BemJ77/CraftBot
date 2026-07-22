@@ -1,0 +1,33 @@
+local CRAFTBOT_DIR = "/craftbot"
+local SERVER_NAME = "server"
+
+term.setBackgroundColor(colors.black)
+term.setTextColor(colors.white)
+term.clear()
+term.setCursorPos(1, 1)
+
+if not fs.exists(CRAFTBOT_DIR) or not fs.isDir(CRAFTBOT_DIR) then
+    printError("Le dossier /craftbot est introuvable.")
+    return
+end
+
+local previousDirectory = shell.dir()
+shell.setDir(CRAFTBOT_DIR)
+
+local serverPath = shell.resolveProgram(SERVER_NAME)
+
+if not serverPath then
+    shell.setDir(previousDirectory)
+    printError("Le programme /craftbot/server est introuvable.")
+    return
+end
+
+local ok, errorMessage = pcall(function()
+    shell.run(SERVER_NAME)
+end)
+
+shell.setDir(previousDirectory)
+
+if not ok then
+    printError("Erreur du serveur : " .. tostring(errorMessage))
+end

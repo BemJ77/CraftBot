@@ -1,0 +1,26 @@
+local items = require("items")
+ 
+return {
+    id = "mcpam",
+    label = "mcpam",
+ 
+    visible = true,
+    category = "burger",
+
+    output = items.mcpam,
+    outputCount = 1,
+ 
+    ingredients = {
+        [1] = items.skillet,
+        [2] = items.groundbeef,
+        [3] = items.salade,
+        [5] = items.oignon,
+        [6] = items.relish,
+        [7] = items.relish,
+        [9] = items.pain,
+    },
+
+	returns = {
+        items.skillet
+    }
+}

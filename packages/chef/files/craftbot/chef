@@ -1,0 +1,737 @@
+local crafter = require("crafter")
+local ae = require("ae")
+local networkManager = require("networkManager")
+local protocol = require("common.protocol")
+local recipeManager = require("recipeManager")
+
+local CHEF_VERSION = "7.0.0"
+local HEARTBEAT_INTERVAL = 3
+local DISCOVERY_INTERVAL = 5
+
+local centralServerId = nil
+local registered = false
+local registrationPending = false
+local chefStatus = "disponible"
+local currentCraft = nil
+local lastCraftError = nil
+local running = true
+local activeCraftContext = nil
+local exportRequestSequence = 0
+local craftQueue = {}
+local craftWorkerBusy = false
+
+local inventoryClean = false
+
+local function ensureCleanInventory(reason)
+    local success, message =
+        crafter.returnAllInventoryToAE()
+
+    if not success then
+        inventoryClean = false
+        chefStatus = "erreur"
+        lastCraftError =
+            "Nettoyage inventaire impossible"
+            .. (
+                reason
+                and " (" .. tostring(reason) .. ")"
+                or ""
+            )
+            .. " : "
+            .. tostring(message)
+
+        printError(lastCraftError)
+        return false, lastCraftError
+    end
+
+    inventoryClean = true
+
+    print(
+        "Inventaire pret"
+        .. (
+            reason
+            and " - " .. tostring(reason)
+            or ""
+        )
+    )
+
+    return true, message
+end
+
+
+local function chefName()
+    return os.getComputerLabel()
+        or ("Chef " .. tostring(os.getComputerID()))
+end
+
+local function sendMessage(receiverId, message)
+    local success, errorMessage = networkManager.send(receiverId, message)
+
+    if not success then
+        printError(
+            "Impossible d'envoyer un message au computer "
+                .. tostring(receiverId)
+                .. " : "
+                .. tostring(errorMessage)
+        )
+    end
+
+    return success
+end
+
+local function discoverCentralServer()
+    networkManager.broadcast(
+        protocol.makeMessage(
+            protocol.TYPE.SERVER_DISCOVER,
+            {
+                role = protocol.ROLE.CHEF,
+                id = os.getComputerID(),
+                name = chefName()
+            }
+        )
+    )
+end
+
+local function registerToCentralServer()
+    if not centralServerId or registrationPending then
+        return false
+    end
+
+    registered = false
+    registrationPending = true
+
+    local sent = sendMessage(
+        centralServerId,
+        protocol.makeMessage(
+            protocol.TYPE.CLIENT_REGISTER,
+            {
+                role = protocol.ROLE.CHEF,
+                id = os.getComputerID(),
+                name = chefName(),
+                clientVersion = CHEF_VERSION,
+                status = chefStatus,
+                currentCraft = currentCraft,
+                error = lastCraftError
+            }
+        )
+    )
+
+    if not sent then
+        registrationPending = false
+    end
+
+    return sent
+end
+
+local function sendHeartbeat()
+    if not centralServerId or not registered then
+        return false
+    end
+
+    return sendMessage(
+        centralServerId,
+        protocol.makeMessage(
+            protocol.TYPE.HEARTBEAT,
+            {
+                role = protocol.ROLE.CHEF,
+                status = chefStatus,
+                currentCraft = currentCraft,
+                error = lastCraftError
+            }
+        )
+    )
+end
+
+local function sendFailure(receiverId, errorMessage)
+    return sendMessage(
+        receiverId,
+        {
+            type = protocol.TYPE.FINISHED,
+            success = false,
+            error = tostring(errorMessage or "Erreur inconnue")
+        }
+    )
+end
+
+local function sendSuccess(receiverId, message)
+    return sendMessage(
+        receiverId,
+        {
+            type = protocol.TYPE.FINISHED,
+            success = true,
+            message = tostring(message or "Fabrication terminee")
+        }
+    )
+end
+
+local function sendProgress(
+    receiverId,
+    message,
+    recipeName,
+    current,
+    total
+)
+    return sendMessage(
+        receiverId,
+        {
+            type = protocol.TYPE.PROGRESS,
+            message = tostring(message or "Fabrication en cours"),
+            recipe = recipeName,
+            current = current,
+            total = total
+        }
+    )
+end
+
+local function formatOrderNumber(orderNumber)
+    if orderNumber == nil or tostring(orderNumber) == "" then
+        return nil
+    end
+
+    local numeric = tonumber(orderNumber)
+    if numeric then
+        return string.format("#%03d", math.floor(numeric))
+    end
+
+    local text = tostring(orderNumber)
+    if text:sub(1, 1) ~= "#" then
+        text = "#" .. text
+    end
+    return text
+end
+
+local function recipeDisplayName(message, recipeName)
+    local label = message.recipeLabel or message.label
+    if label and tostring(label) ~= "" then
+        return tostring(label)
+    end
+
+    return recipeName:sub(1, 1):upper() .. recipeName:sub(2)
+end
+
+local function buildCurrentCraft(message, recipeName, quantity)
+    local parts = {}
+    local orderNumber = formatOrderNumber(message.orderNumber or message.orderId)
+
+    if orderNumber then
+        table.insert(parts, orderNumber)
+    end
+
+    table.insert(parts, recipeDisplayName(message, recipeName))
+    table.insert(parts, "x" .. tostring(quantity))
+    return table.concat(parts, " ")
+end
+
+
+local function nextExportRequestId()
+    exportRequestSequence = exportRequestSequence + 1
+
+    return tostring(os.getComputerID())
+        .. "-"
+        .. tostring(os.epoch("utc"))
+        .. "-"
+        .. tostring(exportRequestSequence)
+end
+
+local function authorizeExport(itemName, quantity, physicalStock)
+    if not centralServerId or not registered or not activeCraftContext then
+        return false, nil, "Aucun contexte serveur actif"
+    end
+
+    local deadline = os.epoch("utc") + 8000
+    local lastReason = nil
+
+    while os.epoch("utc") < deadline do
+        local requestId = nextExportRequestId()
+        local sent = sendMessage(
+            centralServerId,
+            protocol.makeMessage(
+                protocol.TYPE.STOCK_EXPORT_REQUEST,
+                {
+                    requestId = requestId,
+                    orderId = activeCraftContext.orderId,
+                    taskId = activeCraftContext.taskId,
+                    item = itemName,
+                    quantity = quantity,
+                    physicalStock = physicalStock
+                }
+            )
+        )
+
+        if not sent then
+            return false, nil, "Demande d'autorisation impossible"
+        end
+
+        local senderId, response, responseError =
+            networkManager.waitForResponse(requestId, 2)
+
+        if response
+            and senderId == centralServerId
+            and response.type == protocol.TYPE.STOCK_EXPORT_RESPONSE then
+
+            local data = response.data or response
+
+            if data.allowed then
+                return true, data.grantId, nil
+            end
+
+            lastReason = data.reason or "Export refuse par le serveur"
+
+            if not data.retryable then
+                return false, nil, lastReason
+            end
+
+            sleep(math.max(0.05, tonumber(data.retryAfter) or 0.15))
+        else
+            lastReason =
+                responseError
+                or "Delai d'autorisation d'export depasse"
+            sleep(0.1)
+        end
+    end
+
+    return false, nil,
+        lastReason or "Delai d'autorisation d'export depasse"
+end
+
+local function commitExport(
+    grantId,
+    transferred,
+    itemName,
+    requested
+)
+    if not centralServerId or not grantId then
+        return false, "Transaction d'export invalide"
+    end
+
+    local requestId = nextExportRequestId()
+    local sent = sendMessage(
+        centralServerId,
+        protocol.makeMessage(
+            protocol.TYPE.STOCK_EXPORT_COMMIT,
+            {
+                requestId = requestId,
+                grantId = grantId,
+                transferred = transferred,
+                item = itemName,
+                requested = requested
+            }
+        )
+    )
+
+    if not sent then
+        return false, "Confirmation d'export impossible"
+    end
+
+    local senderId, response, responseError =
+        networkManager.waitForResponse(requestId, 3)
+
+    if not response then
+        return false,
+            responseError or "Confirmation d'export non recue"
+    end
+
+    if senderId ~= centralServerId
+        or response.type ~= protocol.TYPE.STOCK_EXPORT_COMMITTED then
+        return false, "Confirmation d'export invalide"
+    end
+
+    local data = response.data or response
+    if not data.success then
+        return false, data.reason or "Confirmation refusee"
+    end
+
+    return true, nil
+end
+
+ae.setExportReservationClient(
+    authorizeExport,
+    commitExport
+)
+
+local function processCraftRequest(senderId, message)
+    local recipeName = tostring(message.recipe or "")
+    local quantity = math.floor(tonumber(message.quantity) or 1)
+
+    if recipeName == "" then
+        sendFailure(senderId, "Nom de recette manquant")
+        return
+    end
+
+    if quantity < 1 then
+        sendFailure(
+            senderId,
+            "La quantite doit etre superieure a zero"
+        )
+        return
+    end
+
+    activeCraftContext = {
+        orderId = message.orderId or message.orderNumber,
+        taskId = message.taskId,
+        phase = message.phase,
+        recipe = recipeName
+    }
+
+    chefStatus = "occupe"
+    currentCraft = buildCurrentCraft(message, recipeName, quantity)
+    lastCraftError = nil
+    sendHeartbeat()
+
+    print("Demande :", recipeName, "x", quantity)
+
+    sendProgress(
+        senderId,
+        "Demarrage de " .. recipeName .. " x" .. tostring(quantity),
+        recipeName,
+        0,
+        quantity
+    )
+
+    for craftIndex = 1, quantity do
+        print(
+            "Fabrication",
+            tostring(craftIndex) .. "/" .. tostring(quantity),
+            ":",
+            recipeName
+        )
+
+        sendProgress(
+            senderId,
+            "Fabrication "
+                .. tostring(craftIndex)
+                .. "/"
+                .. tostring(quantity)
+                .. " : "
+                .. recipeName,
+            recipeName,
+            craftIndex,
+            quantity
+        )
+
+        local callWorked, craftSuccess, craftMessage =
+            pcall(crafter.craftRecipe, recipeName)
+
+        if not callWorked then
+            local errorMessage =
+                "Erreur interne du CraftBot : "
+                .. tostring(craftSuccess)
+
+            printError(errorMessage)
+            sendFailure(senderId, errorMessage)
+            chefStatus = "erreur"
+            currentCraft = buildCurrentCraft(message, recipeName, quantity)
+            lastCraftError = errorMessage
+            activeCraftContext = nil
+            sendHeartbeat()
+            return
+        end
+
+        if not craftSuccess then
+            local errorMessage =
+                craftMessage
+                or (
+                    "La fabrication "
+                    .. tostring(craftIndex)
+                    .. "/"
+                    .. tostring(quantity)
+                    .. " a echoue"
+                )
+
+            printError(
+                "Fabrication echouee : "
+                    .. tostring(errorMessage)
+            )
+            sendFailure(senderId, errorMessage)
+            chefStatus = "erreur"
+            currentCraft = buildCurrentCraft(message, recipeName, quantity)
+            lastCraftError = errorMessage
+            activeCraftContext = nil
+            sendHeartbeat()
+            return
+        end
+
+        sendProgress(
+            senderId,
+            recipeName
+                .. " "
+                .. tostring(craftIndex)
+                .. "/"
+                .. tostring(quantity)
+                .. " termine",
+            recipeName,
+            craftIndex,
+            quantity
+        )
+    end
+
+    local successMessage =
+        recipeName
+        .. " x"
+        .. tostring(quantity)
+        .. " termine avec succes"
+
+    print("Fabrication terminee :", recipeName, "x", quantity)
+    sendSuccess(senderId, successMessage)
+    activeCraftContext = nil
+    chefStatus = "disponible"
+    currentCraft = nil
+    lastCraftError = nil
+    sendHeartbeat()
+end
+
+local function handleMessage(senderId, message)
+    if type(message) ~= "table" then
+        printError("Message reseau invalide")
+        return
+    end
+
+    local messageType = message.type
+    local data = message.data or message
+
+    if messageType == protocol.TYPE.SERVER_ANNOUNCE then
+        local announcedServerId = tonumber(data.id) or senderId
+
+        -- Une annonce repetee du serveur ne doit pas provoquer une
+        -- nouvelle inscription si ce Chef est deja enregistre.
+        if centralServerId == announcedServerId
+            and (registered or registrationPending) then
+            return
+        end
+
+        centralServerId = announcedServerId
+
+        print(
+            "Serveur central detecte :",
+            data.name or ("ID " .. tostring(centralServerId))
+        )
+        registerToCentralServer()
+
+    elseif messageType == protocol.TYPE.CLIENT_REGISTERED then
+        if data.accepted then
+            centralServerId =
+                tonumber(data.serverId)
+                or centralServerId
+                or senderId
+            registered = true
+            registrationPending = false
+
+            print(
+                "Chef enregistre aupres du serveur central (ID "
+                    .. tostring(centralServerId)
+                    .. ")"
+            )
+        else
+            registered = false
+            registrationPending = false
+
+            if data.mustRegister then
+                centralServerId = senderId
+                registerToCentralServer()
+            else
+                printError(
+                    "Inscription refusee : "
+                        .. tostring(data.reason or "raison inconnue")
+                )
+            end
+        end
+
+    elseif messageType == protocol.TYPE.HEARTBEAT_ACK then
+        -- Confirmation silencieuse.
+
+    elseif messageType == protocol.TYPE.CLIENT_GOODBYE
+        and senderId == centralServerId then
+        print("Serveur central deconnecte")
+        centralServerId = nil
+        registered = false
+        registrationPending = false
+
+    elseif messageType == protocol.TYPE.DISCOVER then
+        sendMessage(
+            senderId,
+            {
+                type = protocol.TYPE.DISCOVER_RESPONSE,
+                name = chefName(),
+                busy = chefStatus == "occupe"
+            }
+        )
+
+    elseif messageType == protocol.TYPE.RECIPES_REQUEST then
+        local recipeList, listError = recipeManager.list()
+        local recipeCatalog, catalogError = recipeManager.catalog()
+
+        if not recipeList or not recipeCatalog then
+            sendMessage(
+                senderId,
+                {
+                    type = protocol.TYPE.RECIPES_RESPONSE,
+                    success = false,
+                    error = tostring(listError or catalogError),
+                    recipes = {},
+                    catalog = {}
+                }
+            )
+        else
+            sendMessage(
+                senderId,
+                {
+                    type = protocol.TYPE.RECIPES_RESPONSE,
+                    success = true,
+                    recipes = recipeList,
+                    catalog = recipeCatalog
+                }
+            )
+        end
+
+    elseif messageType == protocol.TYPE.CRAFT_REQUEST then
+        if registered and senderId == centralServerId then
+            craftQueue[#craftQueue + 1] = {
+                senderId = senderId,
+                message = message
+            }
+
+            os.queueEvent("craftbot_craft_queued")
+        else
+            sendFailure(
+                senderId,
+                "Commande refusee : utilisez le serveur central"
+            )
+        end
+
+    elseif messageType == protocol.TYPE.PING then
+        sendMessage(
+            senderId,
+            protocol.makeMessage(
+                protocol.TYPE.PONG,
+                {
+                    role = protocol.ROLE.CHEF,
+                    status = chefStatus
+                }
+            )
+        )
+    end
+end
+
+local function craftWorkerLoop()
+    while running do
+        if #craftQueue == 0 then
+            os.pullEvent("craftbot_craft_queued")
+        end
+
+        while #craftQueue > 0 do
+            local job = table.remove(craftQueue, 1)
+
+            craftWorkerBusy = true
+
+            local cleanSuccess, cleanError =
+                ensureCleanInventory("avant nouvelle tache")
+
+            local ok = cleanSuccess
+            local err = cleanError
+
+            if cleanSuccess then
+                ok, err = pcall(
+                    processCraftRequest,
+                    job.senderId,
+                    job.message
+                )
+            end
+
+            craftWorkerBusy = false
+
+            if not ok then
+                chefStatus = "erreur"
+                lastCraftError =
+                    "Erreur du worker de craft : "
+                    .. tostring(err)
+                printError(lastCraftError)
+                sendFailure(job.senderId, lastCraftError)
+                activeCraftContext = nil
+                sendHeartbeat()
+            end
+        end
+    end
+end
+
+local function heartbeatLoop()
+    local consecutiveFailures = 0
+
+    while running do
+        if registered and centralServerId then
+            local callWorked, sent = pcall(sendHeartbeat)
+
+            if callWorked and sent then
+                consecutiveFailures = 0
+            else
+                consecutiveFailures = consecutiveFailures + 1
+            end
+
+            -- Une perte isolée ne provoque plus de reconnexion.
+            if consecutiveFailures >= 3 then
+                registered = false
+                registrationPending = false
+                centralServerId = nil
+                consecutiveFailures = 0
+            end
+        elseif not registrationPending then
+            local callWorked = pcall(discoverCentralServer)
+
+            if not callWorked then
+                registrationPending = false
+            end
+        end
+
+        sleep(
+            registered
+                and HEARTBEAT_INTERVAL
+                or DISCOVERY_INTERVAL
+        )
+    end
+end
+
+networkManager.setDefaultHandler(handleMessage)
+
+local opened, modemSide = networkManager.open()
+
+if not opened then
+    printError(tostring(modemSide))
+    return
+end
+
+term.clear()
+term.setCursorPos(1, 1)
+
+print("================================")
+print("         CRAFTBOT CHEF")
+print("================================")
+print("Nom         :", chefName())
+print("ID turtle   :", os.getComputerID())
+print("Version     :", CHEF_VERSION)
+print("Modem       :", modemSide)
+print("Protocole   :", protocol.NAME)
+print("")
+print("Nettoyage de l'inventaire apres demarrage...")
+
+local startupClean, startupCleanError =
+    ensureCleanInventory("demarrage")
+
+if not startupClean then
+    printError(
+        "Le Chef ne demarrera pas tant que l'inventaire "
+        .. "ne peut pas etre renvoye dans AE."
+    )
+    return
+end
+
+print("")
+print("Recherche du serveur central...")
+print("Mode V3 : commandes du serveur uniquement.")
+print("")
+
+networkManager.start()
+
+parallel.waitForAny(
+    networkManager.receiveLoop,
+    networkManager.dispatchLoop,
+    craftWorkerLoop,
+    heartbeatLoop
+)

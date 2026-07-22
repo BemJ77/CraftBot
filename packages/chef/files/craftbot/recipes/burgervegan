@@ -1,0 +1,24 @@
+local items = require("items")
+ 
+return {
+    id = "burgervegan",
+    label = "burgervegan",
+ 
+    visible = true,
+    category = "burger",
+
+    output = items.burgervegan,
+    outputCount = 1,
+ 
+    ingredients = {
+        [1] = items.skillet,
+        [2] = items.pain,
+        [3] = items.salade,
+        [5] = items.salade,
+        [6] = items.saucesoja,
+    },
+
+	returns = {
+        items.skillet
+    }
+}

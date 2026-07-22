@@ -1,0 +1,11 @@
+term.setBackgroundColor(colors.black)
+term.setTextColor(colors.white)
+term.clear()
+term.setCursorPos(1, 1)
+
+local previous = shell.dir()
+shell.setDir("/craftbot")
+local ok, err = pcall(function() shell.run("chef") end)
+shell.setDir(previous)
+
+if not ok then printError("Erreur du Chef : " .. tostring(err)) end

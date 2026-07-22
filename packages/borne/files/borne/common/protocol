@@ -1,0 +1,69 @@
+local protocol = {}
+
+protocol.NAME = "craftbot"
+protocol.VERSION = 5
+
+protocol.ROLE = {
+    SERVER = "server",
+    TERMINAL = "terminal",
+    CHEF = "chef",
+    MONITEUR = "moniteur"
+}
+
+protocol.TYPE = {
+    -- Compatibilite
+    CRAFT_REQUEST = "craft_request",
+    PROGRESS = "progress",
+    FINISHED = "finished",
+    DISCOVER = "discover",
+    DISCOVER_RESPONSE = "discover_response",
+    RECIPES_REQUEST = "recipes_request",
+    RECIPES_RESPONSE = "recipes_response",
+    PING = "ping",
+    PONG = "pong",
+
+    -- Connexion centrale
+    SERVER_DISCOVER = "server_discover",
+    SERVER_ANNOUNCE = "server_announce",
+    CLIENT_REGISTER = "client_register",
+    CLIENT_REGISTERED = "client_registered",
+    HEARTBEAT = "heartbeat",
+    HEARTBEAT_ACK = "heartbeat_ack",
+    CLIENT_GOODBYE = "client_goodbye",
+
+    -- Commandes V3
+    ORDER_CREATE = "order_create",
+    ORDER_ACCEPTED = "order_accepted",
+    ORDER_UPDATE = "order_update",
+    ORDER_FINISHED = "order_finished",
+    ORDER_FAILED = "order_failed",
+    ORDER_CANCEL = "order_cancel",
+    ORDER_CANCELLED = "order_cancelled",
+
+    -- Reservations de stock V5
+    RESERVATIONS_REQUEST = "reservations_request",
+    RESERVATIONS_RESPONSE = "reservations_response",
+
+    -- Controle central des exports AE2 V5.2
+    STOCK_EXPORT_REQUEST = "stock_export_request",
+    STOCK_EXPORT_RESPONSE = "stock_export_response",
+    STOCK_EXPORT_COMMIT = "stock_export_commit",
+    STOCK_EXPORT_COMMITTED = "stock_export_committed"
+}
+
+function protocol.isValidRole(role)
+    return role == protocol.ROLE.SERVER
+        or role == protocol.ROLE.TERMINAL
+        or role == protocol.ROLE.CHEF
+        or role == protocol.ROLE.MONITEUR
+end
+
+function protocol.makeMessage(messageType, data)
+    return {
+        type = messageType,
+        version = protocol.VERSION,
+        data = data or {}
+    }
+end
+
+return protocol

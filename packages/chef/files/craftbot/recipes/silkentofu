@@ -1,0 +1,20 @@
+local items = require("items")
+ 
+return {
+    id = "silkentofu",
+    label = "silkentofu",
+ 
+    visible = false,
+    
+    output = items.silkentofu,
+    outputCount = 1,
+ 
+    ingredients = {
+        [1] = items.saucepan,
+        [2] = items.soja,
+    },
+
+	returns = {
+        items.saucepan
+    }
+}

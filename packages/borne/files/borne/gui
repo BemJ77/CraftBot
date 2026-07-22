@@ -1,0 +1,781 @@
+local gui = {}
+
+local monitor
+local width
+local height
+local buttons = {}
+
+gui.theme = {
+    background = colors.black,
+    surface = colors.gray,
+    surfaceAlt = colors.lightGray,
+    primary = colors.blue,
+    primaryDark = colors.cyan,
+    accent = colors.orange,
+    success = colors.lime,
+    danger = colors.red,
+    warning = colors.yellow,
+    text = colors.white,
+    muted = colors.lightGray,
+    darkText = colors.black
+}
+
+local function requireMonitor()
+    if not monitor then
+        error("gui.init() doit etre appele avant d'utiliser l'interface", 2)
+    end
+end
+
+local function clamp(value, minimum, maximum)
+    return math.max(minimum, math.min(maximum, value))
+end
+
+local function fit(text, maxLength)
+    text = tostring(text or "")
+
+    if maxLength <= 0 then
+        return ""
+    end
+
+    if #text <= maxLength then
+        return text
+    end
+
+    if maxLength <= 3 then
+        return text:sub(1, maxLength)
+    end
+
+    return text:sub(1, maxLength - 3) .. "..."
+end
+
+local function fill(x, y, w, h, backgroundColor)
+    requireMonitor()
+
+    x = math.max(1, x)
+    y = math.max(1, y)
+    w = math.min(w, width - x + 1)
+    h = math.min(h, height - y + 1)
+
+    if w <= 0 or h <= 0 then
+        return
+    end
+
+    monitor.setBackgroundColor(backgroundColor)
+
+    for row = y, y + h - 1 do
+        monitor.setCursorPos(x, row)
+        monitor.write(string.rep(" ", w))
+    end
+end
+
+local function splitWords(text, maxWidth)
+    text = tostring(text or "")
+    local lines = {}
+    local current = ""
+
+    for word in text:gmatch("%S+") do
+        if current == "" then
+            current = word
+        elseif #current + 1 + #word <= maxWidth then
+            current = current .. " " .. word
+        else
+            lines[#lines + 1] = current
+            current = word
+        end
+    end
+
+    if current ~= "" then
+        lines[#lines + 1] = current
+    end
+
+    if #lines == 0 then
+        lines[1] = ""
+    end
+
+    return lines
+end
+
+function gui.init(textScale)
+    monitor = peripheral.find("monitor")
+
+    if not monitor then
+        return false, "Aucun moniteur detecte sur la borne"
+    end
+
+    monitor.setTextScale(textScale or 0.5)
+    monitor.setBackgroundColor(gui.theme.background)
+    monitor.setTextColor(gui.theme.text)
+    monitor.clear()
+    monitor.setCursorBlink(false)
+
+    width, height = monitor.getSize()
+    buttons = {}
+
+    return true, monitor
+end
+
+function gui.getMonitor()
+    return monitor
+end
+
+function gui.getSize()
+    requireMonitor()
+    return width, height
+end
+
+function gui.clear(backgroundColor)
+    requireMonitor()
+
+    buttons = {}
+    monitor.setBackgroundColor(backgroundColor or gui.theme.background)
+    monitor.setTextColor(gui.theme.text)
+    monitor.clear()
+    monitor.setCursorPos(1, 1)
+end
+
+function gui.writeAt(x, y, text, textColor, backgroundColor)
+    requireMonitor()
+
+    if y < 1 or y > height or x > width then
+        return
+    end
+
+    x = math.max(1, x)
+    text = fit(text, width - x + 1)
+
+    monitor.setCursorPos(x, y)
+    monitor.setTextColor(textColor or gui.theme.text)
+    monitor.setBackgroundColor(backgroundColor or gui.theme.background)
+    monitor.write(text)
+end
+
+function gui.centerText(y, text, textColor, backgroundColor, x, w)
+    requireMonitor()
+
+    x = x or 1
+    w = w or width
+    text = fit(text, w)
+
+    local textX = x + math.max(0, math.floor((w - #text) / 2))
+    gui.writeAt(textX, y, text, textColor, backgroundColor)
+end
+
+function gui.wrapText(x, y, w, text, textColor, backgroundColor, maxLines)
+    local lines = splitWords(text, w)
+    local count = math.min(#lines, maxLines or #lines)
+
+    for index = 1, count do
+        local line = lines[index]
+
+        if index == count and #lines > count then
+            line = fit(line, math.max(1, w - 3)) .. "..."
+        end
+
+        gui.writeAt(x, y + index - 1, line, textColor, backgroundColor)
+    end
+
+    return count
+end
+
+function gui.topBar(title, subtitle, statusText, statusColor)
+    requireMonitor()
+
+    fill(1, 1, width, 3, gui.theme.primary)
+    gui.writeAt(2, 1, title or "CraftBot", gui.theme.text, gui.theme.primary)
+
+    if statusText and statusText ~= "" then
+        local badgeWidth = math.min(#statusText + 2, math.max(6, math.floor(width / 3)))
+        local badgeX = width - badgeWidth
+        fill(badgeX, 1, badgeWidth, 1, statusColor or gui.theme.success)
+        gui.centerText(
+            1,
+            statusText,
+            gui.theme.darkText,
+            statusColor or gui.theme.success,
+            badgeX,
+            badgeWidth
+        )
+    end
+
+    if subtitle and subtitle ~= "" then
+        gui.writeAt(2, 2, fit(subtitle, width - 3), colors.lightBlue, gui.theme.primary)
+    end
+
+    fill(1, 3, width, 1, gui.theme.primaryDark)
+end
+
+function gui.panel(x, y, w, h, options)
+    requireMonitor()
+    options = options or {}
+
+    local backgroundColor = options.backgroundColor or gui.theme.surface
+    fill(x, y, w, h, backgroundColor)
+
+    if options.title then
+        gui.writeAt(
+            x + 1,
+            y,
+            fit(options.title, math.max(1, w - 2)),
+            options.titleColor or gui.theme.text,
+            backgroundColor
+        )
+    end
+end
+
+function gui.divider(y, color)
+    fill(1, y, width, 1, color or gui.theme.surface)
+end
+
+function gui.button(id, x, y, w, h, label, options)
+    requireMonitor()
+
+    options = options or {}
+
+    local backgroundColor = options.backgroundColor or gui.theme.surface
+    local textColor = options.textColor or gui.theme.text
+    local enabled = options.enabled ~= false
+
+    if not enabled then
+        backgroundColor = colors.lightGray
+        textColor = colors.gray
+    end
+
+    x = math.max(1, x)
+    y = math.max(1, y)
+    w = math.min(w, width - x + 1)
+    h = math.min(h, height - y + 1)
+
+    if w <= 0 or h <= 0 then
+        return
+    end
+
+    fill(x, y, w, h, backgroundColor)
+
+    if options.leftMarker then
+        fill(x, y, 1, h, options.markerColor or gui.theme.accent)
+    end
+
+    local padding = options.leftMarker and 2 or 1
+    local shownLabel = fit(label, math.max(1, w - padding - 1))
+
+    local textX
+    if options.align == "left" then
+        textX = x + padding
+    else
+        textX = x + math.max(0, math.floor((w - #shownLabel) / 2))
+    end
+
+    local textY = y + math.floor((h - 1) / 2)
+    gui.writeAt(textX, textY, shownLabel, textColor, backgroundColor)
+
+    buttons[#buttons + 1] = {
+        id = id,
+        x1 = x,
+        y1 = y,
+        x2 = x + w - 1,
+        y2 = y + h - 1,
+        enabled = enabled,
+        data = options.data
+    }
+end
+
+function gui.waitTouch()
+    requireMonitor()
+
+    while true do
+        local _, side, x, y = os.pullEvent("monitor_touch")
+
+        for index = #buttons, 1, -1 do
+            local button = buttons[index]
+
+            if button.enabled
+                and x >= button.x1
+                and x <= button.x2
+                and y >= button.y1
+                and y <= button.y2 then
+
+                return button.id, button.data, side, x, y
+            end
+        end
+    end
+end
+
+function gui.status(title, message, messageColor, subtitle)
+    gui.clear(gui.theme.background)
+    gui.topBar(title or "CraftBot", subtitle)
+
+    local boxWidth = math.max(12, width - 6)
+    local boxHeight = 7
+    local boxX = math.floor((width - boxWidth) / 2) + 1
+    local boxY = math.max(5, math.floor((height - boxHeight) / 2))
+
+    gui.panel(boxX, boxY, boxWidth, boxHeight, {
+        backgroundColor = gui.theme.surface
+    })
+
+    gui.centerText(
+        boxY + 2,
+        message or "",
+        messageColor or gui.theme.text,
+        gui.theme.surface,
+        boxX + 1,
+        boxWidth - 2
+    )
+
+    gui.centerText(
+        boxY + 4,
+        "Veuillez patienter",
+        gui.theme.muted,
+        gui.theme.surface,
+        boxX + 1,
+        boxWidth - 2
+    )
+end
+
+
+function gui.confirmBox(title, message, yesLabel, noLabel, yesEnabled)
+    gui.clear(gui.theme.background)
+    gui.topBar("CraftBot", title or "Confirmation", "QUESTION", gui.theme.warning)
+
+    local boxWidth = math.max(14, width - 6)
+    local boxHeight = math.min(10, math.max(7, height - 10))
+    local boxX = math.floor((width - boxWidth) / 2) + 1
+    local boxY = 6
+
+    gui.panel(boxX, boxY, boxWidth, boxHeight, {
+        backgroundColor = gui.theme.surface
+    })
+
+    gui.wrapText(
+        boxX + 2,
+        boxY + 2,
+        boxWidth - 4,
+        message or "",
+        gui.theme.text,
+        gui.theme.surface,
+        math.max(1, boxHeight - 4)
+    )
+
+    local gap = 2
+    local buttonWidth = math.max(8, math.floor((width - 6 - gap) / 2))
+    local buttonY = height - 3
+
+    gui.button(
+        "no",
+        2,
+        buttonY,
+        buttonWidth,
+        2,
+        noLabel or "NON",
+        {
+            backgroundColor = gui.theme.danger
+        }
+    )
+
+    gui.button(
+        "yes",
+        width - buttonWidth,
+        buttonY,
+        buttonWidth,
+        2,
+        yesLabel or "OUI",
+        {
+            enabled = yesEnabled ~= false,
+            backgroundColor = gui.theme.success,
+            textColor = gui.theme.darkText
+        }
+    )
+end
+
+function gui.messageBox(title, message, success, buttonLabel)
+    gui.clear(gui.theme.background)
+
+    local statusColor = success and gui.theme.success or gui.theme.danger
+    gui.topBar("CraftBot", title, success and "OK" or "ERREUR", statusColor)
+
+    local boxWidth = math.max(14, width - 6)
+    local boxHeight = math.min(10, math.max(7, height - 10))
+    local boxX = math.floor((width - boxWidth) / 2) + 1
+    local boxY = 6
+
+    gui.panel(boxX, boxY, boxWidth, boxHeight, {
+        backgroundColor = gui.theme.surface
+    })
+
+    gui.wrapText(
+        boxX + 2,
+        boxY + 2,
+        boxWidth - 4,
+        message or "",
+        success and gui.theme.success or colors.pink,
+        gui.theme.surface,
+        math.max(1, boxHeight - 4)
+    )
+
+    local buttonWidth = math.min(18, width - 6)
+    gui.button(
+        "back",
+        math.floor((width - buttonWidth) / 2) + 1,
+        height - 3,
+        buttonWidth,
+        2,
+        buttonLabel or "Retour",
+        {
+            backgroundColor = gui.theme.primary
+        }
+    )
+end
+
+function gui.progress(title, recipeLabel, quantity, message, current, total)
+    gui.clear(gui.theme.background)
+    gui.topBar("CraftBot", title or "Fabrication", "ACTIF", gui.theme.warning)
+
+    local boxX = 3
+    local boxY = 6
+    local boxWidth = width - 4
+    local boxHeight = math.max(8, height - 10)
+
+    gui.panel(boxX, boxY, boxWidth, boxHeight, {
+        backgroundColor = gui.theme.surface
+    })
+
+    current = tonumber(current) or 0
+    total = tonumber(total) or tonumber(quantity) or 1
+
+    if total < 1 then
+        total = 1
+    end
+
+    current = clamp(current, 0, total)
+
+    local percent = math.floor((current / total) * 100 + 0.5)
+
+    gui.writeAt(
+        boxX + 2,
+        boxY + 1,
+        fit(recipeLabel or "Recette", boxWidth - 4),
+        gui.theme.warning,
+        gui.theme.surface
+    )
+
+    gui.writeAt(
+        boxX + 2,
+        boxY + 3,
+        "Progression : " .. tostring(current) .. "/" .. tostring(total),
+        gui.theme.text,
+        gui.theme.surface
+    )
+
+    local percentText = tostring(percent) .. " %"
+    gui.writeAt(
+        boxX + boxWidth - #percentText - 2,
+        boxY + 3,
+        percentText,
+        gui.theme.warning,
+        gui.theme.surface
+    )
+
+    local barX = boxX + 2
+    local barY = boxY + 5
+    local barWidth = math.max(5, boxWidth - 4)
+    local filledWidth = math.floor((barWidth * current) / total)
+
+    fill(barX, barY, barWidth, 1, colors.black)
+
+    if filledWidth > 0 then
+        fill(barX, barY, filledWidth, 1, gui.theme.primaryDark)
+    end
+
+end
+
+function gui.orderProgress(orderNumber, order, activeIndex, current, currentTotal, message)
+    -- Compatibilite avec l'ancien affichage sequentiel.
+    for index, item in ipairs(order) do
+        if not item.status then
+            if index < activeIndex then
+                item.status = "ready"
+                item.current = item.quantity
+                item.total = item.quantity
+            elseif index == activeIndex then
+                item.status = "running"
+                item.current = current
+                item.total = currentTotal
+            else
+                item.status = "waiting"
+                item.current = 0
+                item.total = item.quantity
+            end
+        end
+    end
+
+    return gui.orderProgressMulti(orderNumber, order, message)
+end
+
+function gui.orderProgressMulti(orderNumber, order, message)
+    gui.clear(gui.theme.background)
+    gui.topBar("CraftBot", "Commande en cours", "ACTIF", gui.theme.warning)
+
+    ----------------------------------------------------------------
+    -- Regroupement des tâches par ligne de produit commandée
+    --
+    -- Le scheduler peut découper une ligne entre plusieurs cuistots :
+    --   Burger x7 -> 3 + 2 + 2
+    --
+    -- L'écran client conserve cependant une seule ligne :
+    --   Burger x7    EN COURS
+    ----------------------------------------------------------------
+
+    local groupedOrder = {}
+    local groupedByLine = {}
+
+    for index, task in ipairs(order or {}) do
+        -- Les tâches du scheduler possèdent lineIndex.
+        -- Pour l'ancien mode séquentiel, chaque entrée reste séparée.
+        local lineKey = task.lineIndex or index
+        local group = groupedByLine[lineKey]
+
+        if not group then
+            group = {
+                lineIndex = lineKey,
+                recipe = task.recipe,
+                quantity = 0,
+                current = 0,
+                status = "waiting",
+                hasWaiting = false,
+                hasRunning = false,
+                hasReady = false,
+                hasFailed = false
+            }
+
+            groupedByLine[lineKey] = group
+            groupedOrder[#groupedOrder + 1] = group
+        end
+
+        local quantity = math.max(0, tonumber(task.quantity) or 0)
+        local current = math.max(0, tonumber(task.current) or 0)
+        local total = math.max(1, tonumber(task.total) or quantity or 1)
+
+        group.quantity = group.quantity + quantity
+
+        if task.status == "ready" then
+            group.current = group.current + quantity
+            group.hasReady = true
+        elseif task.status == "running" then
+            -- Conversion de la progression de la sous-tâche vers la
+            -- quantité réellement attribuée à ce cuistot.
+            group.current =
+                group.current
+                + quantity * clamp(current / total, 0, 1)
+            group.hasRunning = true
+        elseif task.status == "failed" then
+            group.hasFailed = true
+        else
+            group.hasWaiting = true
+        end
+    end
+
+    for _, group in ipairs(groupedOrder) do
+        if group.hasFailed then
+            group.status = "failed"
+        elseif group.hasReady
+            and not group.hasRunning
+            and not group.hasWaiting then
+            group.status = "ready"
+            group.current = group.quantity
+        elseif group.hasRunning or group.hasReady then
+            group.status = "running"
+        else
+            group.status = "waiting"
+        end
+
+        group.current = clamp(group.current, 0, group.quantity)
+    end
+
+    local totalUnits = 0
+    local completedUnits = 0
+    local focusIndex = 1
+
+    for index, item in ipairs(groupedOrder) do
+        local quantity = tonumber(item.quantity) or 0
+        local current = tonumber(item.current) or 0
+
+        totalUnits = totalUnits + quantity
+        completedUnits = completedUnits + current
+
+        if item.status == "running" then
+            focusIndex = index
+        elseif item.status == "waiting" and focusIndex == 1 then
+            focusIndex = index
+        end
+    end
+
+    local overallPercent = 0
+
+    if totalUnits > 0 then
+        overallPercent =
+            math.floor((completedUnits / totalUnits) * 100 + 0.5)
+    end
+
+    overallPercent = clamp(overallPercent, 0, 100)
+
+    local boxX = 3
+    local boxY = 5
+    local boxWidth = width - 4
+    local boxHeight = height - 7
+
+    gui.panel(boxX, boxY, boxWidth, boxHeight, {
+        backgroundColor = gui.theme.surface
+    })
+
+    gui.writeAt(
+        boxX + 2,
+        boxY + 1,
+        fit("Commande " .. tostring(orderNumber), boxWidth - 4),
+        gui.theme.warning,
+        gui.theme.surface
+    )
+
+    local percentText = tostring(overallPercent) .. " %"
+
+    gui.writeAt(
+        boxX + 2,
+        boxY + 3,
+        "Progression totale",
+        gui.theme.text,
+        gui.theme.surface
+    )
+
+    gui.writeAt(
+        boxX + boxWidth - #percentText - 2,
+        boxY + 3,
+        percentText,
+        gui.theme.warning,
+        gui.theme.surface
+    )
+
+    local barX = boxX + 2
+    local barY = boxY + 5
+    local barWidth = math.max(5, boxWidth - 4)
+    local filledWidth = math.floor((barWidth * overallPercent) / 100)
+
+    fill(barX, barY, barWidth, 1, colors.black)
+
+    if filledWidth > 0 then
+        fill(barX, barY, filledWidth, 1, gui.theme.primaryDark)
+    end
+
+    local listTitleY = barY + 2
+
+    gui.writeAt(
+        boxX + 2,
+        listTitleY,
+        "Contenu de la commande",
+        gui.theme.muted,
+        gui.theme.surface
+    )
+
+    local firstRowY = listTitleY + 2
+    local bottomMessageLines = 0
+    local availableRows =
+        math.max(
+            1,
+            boxY + boxHeight - firstRowY - bottomMessageLines
+        )
+
+    local startIndex = 1
+
+    if #groupedOrder > availableRows then
+        startIndex =
+            clamp(
+                focusIndex - math.floor(availableRows / 2),
+                1,
+                #groupedOrder - availableRows + 1
+            )
+    end
+
+    local endIndex =
+        math.min(#groupedOrder, startIndex + availableRows - 1)
+
+    for index = startIndex, endIndex do
+        local item = groupedOrder[index]
+        local label =
+            tostring(item.recipe.label or item.recipe.id)
+            .. " x"
+            .. tostring(item.quantity)
+
+        local status
+        local statusColor
+
+        if item.status == "ready" then
+            status = "PRET"
+            statusColor = gui.theme.success
+        elseif item.status == "running" then
+            status = "EN COURS"
+            statusColor = gui.theme.warning
+
+            local shownCurrent = math.floor(item.current + 0.5)
+            label =
+                label
+                .. " ("
+                .. tostring(shownCurrent)
+                .. "/"
+                .. tostring(item.quantity)
+                .. ")"
+        elseif item.status == "failed" then
+            status = "ERREUR"
+            statusColor = gui.theme.danger
+        else
+            status = "EN ATTENTE"
+            statusColor = gui.theme.muted
+        end
+
+        local rowY = firstRowY + (index - startIndex)
+        local statusWidth = #status
+        local labelWidth = math.max(1, boxWidth - statusWidth - 6)
+
+        gui.writeAt(
+            boxX + 2,
+            rowY,
+            fit(label, labelWidth),
+            gui.theme.text,
+            gui.theme.surface
+        )
+
+        gui.writeAt(
+            boxX + boxWidth - statusWidth - 2,
+            rowY,
+            status,
+            statusColor,
+            gui.theme.surface
+        )
+    end
+
+    if #groupedOrder > availableRows then
+        local rangeText =
+            tostring(startIndex)
+            .. "-"
+            .. tostring(endIndex)
+            .. "/"
+            .. tostring(#groupedOrder)
+
+        gui.writeAt(
+            boxX + 2,
+            boxY + boxHeight - 3,
+            rangeText,
+            gui.theme.muted,
+            gui.theme.surface
+        )
+    end
+
+end
+
+function gui.drawPageIndicator(page, pageCount, y)
+    local label = tostring(page) .. " / " .. tostring(pageCount)
+    gui.centerText(y, label, gui.theme.muted)
+end
+
+function gui.resetButtons()
+    buttons = {}
+end
+
+return gui

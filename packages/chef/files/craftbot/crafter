@@ -1,0 +1,935 @@
+local inventory = require("inventory")
+local ae = require("ae")
+local logger = require("logger")
+
+local crafter = {}
+local craftDepth = 0
+
+--- Charge une recette depuis le dossier recipes.
+---@param recipeName string
+---@return table|nil, string
+function crafter.loadRecipe(recipeName)
+    if type(recipeName) ~= "string" or recipeName == "" then
+        return nil, "Nom de recette invalide"
+    end
+
+    local moduleName = "recipes." .. recipeName
+    local success, recipe = pcall(require, moduleName)
+
+    if not success then
+        return nil, "Impossible de charger la recette : " .. tostring(recipe)
+    end
+
+    if type(recipe) ~= "table" then
+        return nil, "La recette ne retourne pas une table"
+    end
+
+    return recipe, "Recette chargee"
+end
+
+function crafter.findRecipeByOutput(itemName)
+    if type(itemName) ~= "string" or itemName == "" then
+        return nil, "Identifiant d'objet invalide"
+    end
+
+    local recipesPath = "craftbot/recipes"
+
+    if not fs.exists(recipesPath) or not fs.isDir(recipesPath) then
+        return nil, "Dossier de recettes introuvable : " .. recipesPath
+    end
+
+    local files = fs.list(recipesPath)
+
+    for _, fileName in ipairs(files) do
+        local fullPath = recipesPath .. "/" .. fileName
+
+        if not fs.isDir(fullPath) then
+            local recipeName = fileName:gsub("%.lua$", "")
+
+            if recipeName ~= "init" then
+                local recipe = crafter.loadRecipe(recipeName)
+
+                if recipe and recipe.output == itemName then
+                    return recipe, "Recette trouvee"
+                end
+            end
+        end
+    end
+
+    return nil, "Aucune recette ne produit " .. itemName
+end
+
+function crafter.craftMissingIngredient(itemName, count)
+    count = tonumber(count) or 1
+
+    if type(itemName) ~= "string" or itemName == "" then
+        return false, "Nom d'ingredient invalide"
+    end
+
+    if count <= 0 then
+        return true, "Aucun ingredient a fabriquer"
+    end
+
+    local recipe =
+        crafter.findRecipeByOutput(itemName)
+
+    if not recipe then
+        return false,
+            "Aucune recette trouvee pour "
+            .. itemName
+    end
+
+    local outputCount =
+        tonumber(recipe.outputCount) or 1
+
+    if outputCount <= 0 then
+        outputCount = 1
+    end
+
+    local craftCount =
+        math.ceil(count / outputCount)
+
+    logger.detail(
+        "Craft automatique : "
+        .. itemName
+        .. " - "
+        .. tostring(craftCount)
+        .. " craft(s)"
+    )
+
+    for craftIndex = 1, craftCount do
+        logger.detail(
+            "Sous-craft "
+            .. tostring(craftIndex)
+            .. "/"
+            .. tostring(craftCount)
+            .. " : "
+            .. tostring(recipe.id)
+        )
+
+        logger.push()
+
+        local success, message =
+            crafter.craftRecipe(recipe.id, true)
+
+        logger.pop()
+
+        if not success then
+            return false,
+                "Impossible de fabriquer "
+                .. itemName
+                .. " : "
+                .. tostring(message)
+        end
+
+        -- Le sous-craft doit avoir range son resultat
+        -- dans le reseau Applied Energistics.
+        local availableCount =
+            tonumber(ae.getItemCount(itemName)) or 0
+
+        logger.debug(
+            "Verification AE apres sous-craft :",
+            itemName,
+            "disponible:",
+            tostring(availableCount)
+        )
+
+        if availableCount <= 0 then
+            return false,
+                "Le sous-craft "
+                .. tostring(recipe.id)
+                .. " est termine, mais "
+                .. itemName
+                .. " n'a pas ete stocke dans AE"
+        end
+    end
+
+    local finalCount =
+        tonumber(ae.getItemCount(itemName)) or 0
+
+    if finalCount < count then
+        return false,
+            "Quantite insuffisante dans AE apres fabrication : "
+            .. itemName
+            .. " attendu x"
+            .. tostring(count)
+            .. ", disponible x"
+            .. tostring(finalCount)
+    end
+
+    return true,
+        itemName
+        .. " fabrique et stocke dans AE x"
+        .. tostring(finalCount)
+end
+
+local function getRecipeSlots(recipe)
+    local recipeSlots = {}
+
+    for slot, itemName in pairs(recipe.ingredients) do
+        if itemName then
+            recipeSlots[slot] = true
+        end
+    end
+
+    return recipeSlots
+end
+
+local function findBufferSlot(itemName, recipeSlots)
+    for slot = 1, 16 do
+        if not recipeSlots[slot] then
+            local item = turtle.getItemDetail(slot)
+
+            if item
+                and item.name == itemName
+                and item.count < 64 then
+                return slot
+            end
+        end
+    end
+
+    for slot = 1, 16 do
+        if not recipeSlots[slot]
+            and turtle.getItemCount(slot) == 0 then
+            return slot
+        end
+    end
+
+    return nil
+end
+
+
+function crafter.returnAllInventoryToAE()
+    local totalTransferred = 0
+
+    for slot = 1, 16 do
+        local item = turtle.getItemDetail(slot)
+
+        if item then
+            local itemName = item.name
+            local itemCount = item.count
+
+            local transferred, err =
+                ae.importItem(itemName, itemCount)
+
+            transferred = tonumber(transferred) or 0
+
+            if transferred < itemCount then
+                return false,
+                    "Nettoyage incomplet du slot "
+                    .. tostring(slot)
+                    .. " : "
+                    .. tostring(itemName)
+                    .. " "
+                    .. tostring(transferred)
+                    .. "/"
+                    .. tostring(itemCount)
+                    .. (
+                        err
+                        and " - " .. tostring(err)
+                        or ""
+                    )
+            end
+
+            totalTransferred =
+                totalTransferred + transferred
+
+            logger.debug(
+                "Nettoyage reprise :",
+                itemName,
+                "x",
+                tostring(transferred),
+                "depuis slot",
+                tostring(slot)
+            )
+        end
+    end
+
+    turtle.select(1)
+
+    return true,
+        "Inventaire nettoye : "
+        .. tostring(totalTransferred)
+        .. " objet(s) renvoye(s) dans AE"
+end
+
+function crafter.clearCraftingGrid(recipe)
+    if type(recipe) ~= "table"
+        or type(recipe.ingredients) ~= "table" then
+        return false, "Recette invalide"
+    end
+
+    local recipeSlots = getRecipeSlots(recipe)
+
+    for slot = 1, 16 do
+        if recipeSlots[slot] then
+            local item = turtle.getItemDetail(slot)
+
+            if item then
+                local bufferSlot = findBufferSlot(item.name, recipeSlots)
+
+                if not bufferSlot then
+                    return false,
+                        "Aucun slot de reserve pour vider le slot "
+                        .. slot
+                end
+
+                logger.debug(
+                    "Nettoyage grille : slot",
+                    tostring(slot),
+                    "->",
+                    tostring(bufferSlot),
+                    item.name,
+                    "x",
+                    tostring(item.count)
+                )
+
+                turtle.select(slot)
+
+                if not turtle.transferTo(bufferSlot) then
+                    return false,
+                        "Impossible de vider le slot " .. slot
+                end
+            end
+        end
+    end
+
+    return true, "Grille nettoyee"
+end
+
+function crafter.checkRecipe(recipe)
+    if type(recipe) ~= "table" then
+        return false, "Recette invalide"
+    end
+
+    if type(recipe.ingredients) ~= "table" then
+        return false, "La recette ne contient aucun ingredient"
+    end
+
+    local requiredItems = {}
+
+    for _, itemName in pairs(recipe.ingredients) do
+        if itemName then
+            requiredItems[itemName] = (requiredItems[itemName] or 0) + 1
+        end
+    end
+
+    for itemName, requiredAmount in pairs(requiredItems) do
+        local result = inventory.findAllItems(itemName)
+
+        if result.total < requiredAmount then
+            return false,
+                string.format(
+                    "Ingredient manquant : %s (%d/%d)",
+                    itemName,
+                    result.total,
+                    requiredAmount
+                )
+        end
+    end
+
+    return true, "Tous les ingredients sont disponibles"
+end
+
+function crafter.requestIngredients(recipe)
+    if type(recipe) ~= "table"
+        or type(recipe.ingredients) ~= "table" then
+        return false, "Recette invalide"
+    end
+
+    local requiredItems = {}
+
+    -- Regrouper les ingredients identiques.
+    -- Exemple : trois cases de ble donnent minecraft:wheat = 3.
+    for _, itemName in pairs(recipe.ingredients) do
+        if itemName then
+            requiredItems[itemName] =
+                (requiredItems[itemName] or 0) + 1
+        end
+    end
+
+    local pass = 0
+    local maxPasses = 20
+
+    ----------------------------------------------------------------
+    -- VERIFICATION EN PLUSIEURS PASSES
+    --
+    -- Les sous-crafts peuvent consommer un objet qui avait deja
+    -- ete fabrique pour la recette parente.
+    --
+    -- On recommence donc toute la verification jusqu'a ce que
+    -- tous les ingredients soient presents simultanement dans AE.
+    ----------------------------------------------------------------
+    while true do
+        pass = pass + 1
+
+        if pass > maxPasses then
+            return false,
+                "Impossible de stabiliser les ingredients apres "
+                .. tostring(maxPasses)
+                .. " verifications"
+        end
+
+        logger.debug(
+            "Verification des ingredients AE - passe",
+            tostring(pass)
+        )
+
+        local allAvailable = true
+        local craftedDuringPass = false
+
+        for itemName, requiredCount in pairs(requiredItems) do
+            local availableCount =
+                tonumber(ae.getItemCount(itemName)) or 0
+
+            local missingCount =
+                math.max(
+                    requiredCount - availableCount,
+                    0
+                )
+
+            logger.debug(
+                itemName,
+                "necessaire:",
+                tostring(requiredCount),
+                "present dans AE:",
+                tostring(availableCount),
+                "manquant:",
+                tostring(missingCount)
+            )
+
+            if missingCount > 0 then
+                allAvailable = false
+
+                logger.warn(
+                    "Absent de AE : "
+                    .. itemName
+                    .. " x"
+                    .. tostring(missingCount)
+                )
+
+                local success, message =
+                    crafter.craftMissingIngredient(
+                        itemName,
+                        missingCount
+                    )
+
+                if not success then
+                    return false,
+                        "Impossible de fabriquer "
+                        .. itemName
+                        .. " : "
+                        .. tostring(message)
+                end
+
+                craftedDuringPass = true
+            end
+        end
+
+        ----------------------------------------------------------------
+        -- Même si tous les objets manquants ont ete fabriques pendant
+        -- cette passe, on ne sort pas immédiatement.
+        --
+        -- Un autocraft lance plus tard dans la boucle a pu consommer
+        -- un ingredient verifie ou fabrique plus tot.
+        ----------------------------------------------------------------
+        local finalCheckSuccessful = true
+
+        for itemName, requiredCount in pairs(requiredItems) do
+            local availableCount =
+                tonumber(ae.getItemCount(itemName)) or 0
+
+            if availableCount < requiredCount then
+                finalCheckSuccessful = false
+
+                logger.debug(
+                    "Ingredient a reverifier :",
+                    itemName,
+                    "necessaire:",
+                    tostring(requiredCount),
+                    "present dans AE:",
+                    tostring(availableCount)
+                )
+            end
+        end
+
+        if allAvailable and finalCheckSuccessful then
+            break
+        end
+
+        if finalCheckSuccessful then
+            -- Des crafts ont eu lieu, mais tous les ingredients
+            -- sont finalement disponibles. On peut sortir.
+            break
+        end
+
+        if not craftedDuringPass then
+            return false,
+                "Des ingredients sont insuffisants dans AE, "
+                .. "mais aucun autocraft n'a pu les completer"
+        end
+
+        logger.debug(
+            "Un sous-craft a consomme un ingredient du craft parent,",
+            "nouvelle verification"
+        )
+    end
+
+    ----------------------------------------------------------------
+    -- DERNIERE VERIFICATION JUSTE AVANT L'EXPORT
+    ----------------------------------------------------------------
+    for itemName, requiredCount in pairs(requiredItems) do
+        local availableCount =
+            tonumber(ae.getItemCount(itemName)) or 0
+
+        if availableCount < requiredCount then
+            return false,
+                "Quantite insuffisante avant export : "
+                .. itemName
+                .. " attendu x"
+                .. tostring(requiredCount)
+                .. ", disponible x"
+                .. tostring(availableCount)
+        end
+    end
+
+    ----------------------------------------------------------------
+    -- EXPORT
+    --
+    -- Aucun ingredient n'est exporte avant que tous les autocrafts
+    -- et toutes les reverifications soient termines.
+    ----------------------------------------------------------------
+    for itemName, requiredCount in pairs(requiredItems) do
+        local transferred, exportError =
+            ae.exportItem(itemName, requiredCount)
+
+        transferred = tonumber(transferred) or 0
+
+        if transferred < requiredCount then
+            return false,
+                "AE n'a fourni que "
+                .. tostring(transferred)
+                .. "/"
+                .. tostring(requiredCount)
+                .. " x "
+                .. itemName
+                .. (
+                    exportError
+                    and " : " .. tostring(exportError)
+                    or ""
+                )
+        end
+
+        logger.debug(
+            "Ingredient exporte :",
+            itemName,
+            "x",
+            tostring(transferred)
+        )
+    end
+
+    return true,
+        "Tous les ingredients necessaires sont presents"
+end
+
+function crafter.placeRecipe(recipe)
+    if type(recipe) ~= "table"
+        or type(recipe.ingredients) ~= "table" then
+        return false, "Recette invalide"
+    end
+
+    local recipeSlots = getRecipeSlots(recipe)
+
+    -- 1. Retirer les objets qui ne correspondent pas
+    -- à l'ingredient attendu dans leur emplacement.
+    for targetSlot = 1, 16 do
+        local expectedItem = recipe.ingredients[targetSlot]
+
+        if expectedItem then
+            local currentItem = turtle.getItemDetail(targetSlot)
+
+            if currentItem and currentItem.name ~= expectedItem then
+                local bufferSlot =
+                    findBufferSlot(currentItem.name, recipeSlots)
+
+                if not bufferSlot then
+                    return false,
+                        "Aucun slot libre pour deplacer "
+                        .. currentItem.name
+                end
+
+                logger.debug(
+                    "Objet mal place : slot",
+                    tostring(targetSlot),
+                    "-> slot",
+                    tostring(bufferSlot)
+                )
+
+                turtle.select(targetSlot)
+
+                if not turtle.transferTo(bufferSlot) then
+                    return false,
+                        "Impossible de vider le slot "
+                        .. tostring(targetSlot)
+                end
+            end
+        end
+    end
+
+    -- 2. Placer un exemplaire de chaque ingredient
+    -- dans les emplacements de la recette.
+    for targetSlot = 1, 16 do
+        local expectedItem = recipe.ingredients[targetSlot]
+
+        if expectedItem then
+            local currentItem = turtle.getItemDetail(targetSlot)
+
+            -- Une pile de plusieurs objets est acceptable.
+            -- Les exemplaires supplémentaires pourront servir
+            -- à remplir les autres emplacements.
+            local alreadyCorrect =
+                currentItem
+                and currentItem.name == expectedItem
+                and currentItem.count >= 1
+
+            if not alreadyCorrect then
+                local sourceSlot = nil
+
+                -- Priorité aux emplacements hors de la grille.
+                for slot = 1, 16 do
+                    if not recipeSlots[slot] then
+                        local item = turtle.getItemDetail(slot)
+
+                        if item and item.name == expectedItem then
+                            sourceSlot = slot
+                            break
+                        end
+                    end
+                end
+
+                -- Si nécessaire, utiliser le surplus d'une pile
+                -- déjà présente dans la grille.
+                if not sourceSlot then
+                    for slot = 1, 16 do
+                        if slot ~= targetSlot then
+                            local item = turtle.getItemDetail(slot)
+
+                            if item and item.name == expectedItem then
+                                local expectedInSource =
+                                    recipe.ingredients[slot]
+
+                                -- Si l'objet est déjà bien placé dans
+                                -- son emplacement, on conserve un exemplaire.
+                                if expectedInSource == expectedItem then
+                                    if item.count > 1 then
+                                        sourceSlot = slot
+                                        break
+                                    end
+                                else
+                                    sourceSlot = slot
+                                    break
+                                end
+                            end
+                        end
+                    end
+                end
+
+                if not sourceSlot then
+                    return false,
+                        "Ingredient introuvable : "
+                        .. expectedItem
+                end
+
+                logger.debug(
+                    "Placement : slot",
+                    tostring(sourceSlot),
+                    "-> slot",
+                    tostring(targetSlot)
+                )
+
+                turtle.select(sourceSlot)
+
+                if not turtle.transferTo(targetSlot, 1) then
+                    return false,
+                        "Impossible de placer "
+                        .. expectedItem
+                        .. " dans le slot "
+                        .. tostring(targetSlot)
+                end
+            end
+        end
+    end
+
+    return true, "Recette correctement placee"
+end
+
+function crafter.craft(recipe)
+    if type(recipe) ~= "table" then
+        return false, "Recette invalide"
+    end
+
+    local success, result = turtle.craft(1)
+
+    logger.debug(
+        "Retour turtle.craft(1) :",
+        tostring(success),
+        tostring(result)
+    )
+
+    if not success then
+        return false,
+            "La fabrication a echoue"
+            .. (result and " : " .. tostring(result) or "")
+    end
+
+    return true, "Fabrication reussie"
+end
+
+function crafter.storeResult(recipe)
+    if type(recipe) ~= "table" then
+        return false, "Recette invalide"
+    end
+
+    if not recipe.output then
+        return false, "Aucun resultat defini dans la recette"
+    end
+
+    local outputName = recipe.output
+    local expectedCount = recipe.outputCount or 1
+    local storedCount = 0
+
+    for slot = 1, 16 do
+        local item = turtle.getItemDetail(slot)
+
+        if item and item.name == outputName then
+            local remainingCount = expectedCount - storedCount
+
+            if remainingCount <= 0 then
+                break
+            end
+
+            local countToStore =
+                math.min(item.count, remainingCount)
+
+            turtle.select(slot)
+
+            local transferred, err =
+                ae.importItem(outputName, countToStore)
+
+            transferred = tonumber(transferred) or 0
+
+            if transferred <= 0 then
+                return false,
+                    "Impossible de stocker "
+                    .. outputName
+                    .. " dans AE"
+                    .. (err and " : " .. tostring(err) or "")
+            end
+
+            storedCount = storedCount + transferred
+
+            logger.debug(
+                "Resultat stocke :",
+                outputName,
+                "x",
+                tostring(transferred),
+                "depuis le slot",
+                tostring(slot)
+            )
+        end
+    end
+
+    if storedCount < expectedCount then
+        return false,
+            "Resultat incomplet : "
+            .. outputName
+            .. " attendu x"
+            .. tostring(expectedCount)
+            .. ", trouve x"
+            .. tostring(storedCount)
+    end
+
+    return true,
+        "Resultat stocke : "
+        .. outputName
+        .. " x"
+        .. tostring(storedCount)
+end
+
+function crafter.storeReturnedItems(recipe)
+    if type(recipe) ~= "table" then
+        return false, "Recette invalide"
+    end
+
+    if type(recipe.returns) ~= "table" then
+        return true, "Aucun objet reutilisable a stocker"
+    end
+
+    for _, itemName in ipairs(recipe.returns) do
+        if type(itemName) ~= "string" or itemName == "" then
+            return false, "Objet reutilisable invalide"
+        end
+
+        local foundCount = 0
+
+        for slot = 1, 16 do
+            local item = turtle.getItemDetail(slot)
+
+            if item and item.name == itemName then
+                foundCount = foundCount + item.count
+            end
+        end
+
+        if foundCount < 1 then
+            return false,
+                "Objet reutilisable introuvable : " .. itemName
+        end
+
+        local transferred, err = ae.importItem(itemName, 1)
+        transferred = transferred or 0
+
+        if transferred < 1 then
+            return false,
+                "Import de l'objet reutilisable incomplet : "
+                .. itemName
+                .. " "
+                .. transferred
+                .. "/1"
+                .. (err and " - " .. tostring(err) or "")
+        end
+
+        logger.debug("Objet reutilisable stocke :", itemName)
+    end
+
+    return true, "Objets reutilisables stockes"
+end
+
+function crafter.craftRecipe(recipeName)
+    local isSubCraft = craftDepth > 0
+
+    if isSubCraft then
+        logger.push()
+    end
+
+    craftDepth = craftDepth + 1
+    logger.craftStart(recipeName, isSubCraft)
+
+    local function finish(success, message)
+        logger.craftEnd(recipeName, success)
+        craftDepth = math.max(craftDepth - 1, 0)
+
+        if isSubCraft then
+            logger.pop()
+        end
+
+        return success, message
+    end
+
+    local function failStep(message)
+        logger.fail(message)
+        return finish(false, message)
+    end
+
+    if type(recipeName) ~= "string" or recipeName == "" then
+        logger.step("Validation du nom de recette")
+        return failStep("Nom de recette invalide")
+    end
+
+    logger.step("Chargement de la recette")
+    local recipe, message = crafter.loadRecipe(recipeName)
+
+    if not recipe then
+        return failStep(
+            "Chargement de la recette impossible : "
+            .. tostring(message)
+        )
+    end
+    logger.ok()
+
+    logger.step("Nettoyage de la grille")
+    local success
+    success, message = crafter.clearCraftingGrid(recipe)
+
+    if not success then
+        return failStep(
+            "Nettoyage de la grille impossible : "
+            .. tostring(message)
+        )
+    end
+    logger.ok()
+
+    logger.step("Recuperation des ingredients")
+    success, message = crafter.requestIngredients(recipe)
+
+    if not success then
+        return failStep(
+            "Demande des ingredients impossible : "
+            .. tostring(message)
+        )
+    end
+    logger.ok()
+
+    logger.step("Verification des ingredients")
+    success, message = crafter.checkRecipe(recipe)
+
+    if not success then
+        return failStep(
+            "Verification des ingredients impossible : "
+            .. tostring(message)
+        )
+    end
+    logger.ok()
+
+    logger.step("Placement de la recette")
+    success, message = crafter.placeRecipe(recipe)
+
+    if not success then
+        return failStep(
+            "Placement de la recette impossible : "
+            .. tostring(message)
+        )
+    end
+    logger.ok()
+
+    logger.step("Fabrication")
+    success, message = crafter.craft(recipe)
+
+    if not success then
+        return failStep(
+            "Fabrication impossible : "
+            .. tostring(message)
+        )
+    end
+    logger.ok()
+
+    logger.step("Stockage du resultat")
+    success, message = crafter.storeResult(recipe)
+
+    if not success then
+        return failStep(
+            "Stockage du resultat impossible : "
+            .. tostring(message)
+        )
+    end
+    logger.ok()
+
+    logger.step("Stockage des outils reutilisables")
+    success, message = crafter.storeReturnedItems(recipe)
+
+    if not success then
+        return failStep(
+            "Stockage des outils reutilisables impossible : "
+            .. tostring(message)
+        )
+    end
+    logger.ok()
+
+    return finish(
+        true,
+        "Fabrication de "
+        .. recipeName
+        .. " terminee avec succes"
+    )
+end
+
+return crafter

@@ -1,0 +1,20 @@
+local items = require("items")
+ 
+return {
+    id = "relish",
+    label = "relish",
+ 
+    visible = false,
+    
+    output = items.relish,
+    outputCount = 1,
+ 
+    ingredients = {
+        [1] = items.juicer,
+        [2] = items.concombre,
+    },
+
+	returns = {
+        items.juicer
+    }
+}

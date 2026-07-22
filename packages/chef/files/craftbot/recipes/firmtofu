@@ -1,0 +1,20 @@
+local items = require("items")
+ 
+return {
+    id = "firmtofu",
+    label = "firmtofu",
+ 
+    visible = false,
+    
+    output = items.firmtofu,
+    outputCount = 1,
+ 
+    ingredients = {
+        [1] = items.silkentofu,
+        [2] = items.roller,
+    },
+
+	returns = {
+        items.roller
+    }
+}

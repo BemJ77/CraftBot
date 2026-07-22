@@ -1,0 +1,527 @@
+-- craftbot/inventory.lua
+-- Gestion de l'inventaire de la Crafting Turtle
+
+local inventory = {}
+
+-- Emplacements utilisés par la grille de craft 3 × 3.
+local CRAFTING_SLOTS = {
+    1, 2, 3,
+    5, 6, 7,
+    9, 10, 11
+}
+
+-- Emplacements qui ne font pas partie de la grille de craft.
+local BUFFER_SLOTS = {
+    4, 8, 12,
+    13, 14, 15, 16
+}
+
+local function isValidSlot(slot)
+    return type(slot) == "number"
+        and slot >= 1
+        and slot <= 16
+        and slot % 1 == 0
+end
+
+local function isCraftingSlot(slot)
+    for _, craftingSlot in ipairs(CRAFTING_SLOTS) do
+        if craftingSlot == slot then
+            return true
+        end
+    end
+
+    return false
+end
+
+--- Retourne les informations de l'objet contenu dans un slot.
+---@param slot number
+---@return table|nil
+function inventory.getItem(slot)
+    if not isValidSlot(slot) then
+        return nil
+    end
+
+    return turtle.getItemDetail(slot)
+end
+
+--- Retourne true si l'inventaire complet est vide.
+---@return boolean
+function inventory.isEmpty()
+    for slot = 1, 16 do
+        if turtle.getItemCount(slot) > 0 then
+            return false
+        end
+    end
+
+    return true
+end
+
+--- Compte la quantité totale d'un objet dans la turtle.
+---@param itemName string
+---@return number
+function inventory.countItem(itemName)
+    local total = 0
+
+    for slot = 1, 16 do
+        local item = turtle.getItemDetail(slot)
+
+        if item and item.name == itemName then
+            total = total + item.count
+        end
+    end
+
+    return total
+end
+
+--- Recherche un slot contenant l'objet demandé.
+---@param itemName string
+---@param excludedSlots table|nil Slots qui ne doivent pas être utilisés.
+---@return number|nil
+function inventory.findItem(itemName, excludedSlots)
+    excludedSlots = excludedSlots or {}
+
+    for slot = 1, 16 do
+        local excluded = excludedSlots[slot] == true
+        local item = turtle.getItemDetail(slot)
+
+        if not excluded and item and item.name == itemName then
+            return slot
+        end
+    end
+
+    return nil
+end
+
+function inventory.findAllItems(itemName)
+    local result = {
+        total = 0,
+        slots = {}
+    }
+
+    for slot = 1, 16 do
+        local item = turtle.getItemDetail(slot)
+
+        if item and item.name == itemName then
+            result.total = result.total + item.count
+
+            table.insert(result.slots, {
+                slot = slot,
+                count = item.count
+            })
+        end
+    end
+
+    return result
+end
+--- Recherche un emplacement pouvant recevoir un objet.
+---@param itemName string
+---@param excludedSlots table|nil
+---@return number|nil
+local function findDestination(itemName, excludedSlots)
+    excludedSlots = excludedSlots or {}
+
+    -- On utilise en priorité les emplacements hors de la grille.
+    for _, slot in ipairs(BUFFER_SLOTS) do
+        if not excludedSlots[slot] then
+            local item = turtle.getItemDetail(slot)
+
+            if not item then
+                return slot
+            end
+
+            if item.name == itemName
+                and item.count < turtle.getItemSpace(slot) + item.count then
+                return slot
+            end
+        end
+    end
+
+    -- Si nécessaire, on utilise un emplacement de craft pas encore verrouillé.
+    for _, slot in ipairs(CRAFTING_SLOTS) do
+        if not excludedSlots[slot] then
+            local item = turtle.getItemDetail(slot)
+
+            if not item then
+                return slot
+            end
+
+            if item.name == itemName
+                and turtle.getItemSpace(slot) > 0 then
+                return slot
+            end
+        end
+    end
+
+    return nil
+end
+
+--- Déplace tout le contenu d'un slot vers un autre emplacement disponible.
+---@param sourceSlot number
+---@param excludedSlots table|nil
+---@return boolean
+---@return string|nil
+local function moveSlotAway(sourceSlot, excludedSlots)
+    local item = turtle.getItemDetail(sourceSlot)
+
+    if not item then
+        return true, nil
+    end
+
+    local destination = findDestination(item.name, excludedSlots)
+
+    if not destination then
+        return false,
+            "Aucun emplacement disponible pour deplacer " .. item.name
+    end
+
+    turtle.select(sourceSlot)
+
+    if not turtle.transferTo(destination) then
+        return false,
+            "Impossible de deplacer le slot " ..
+            sourceSlot ..
+            " vers le slot " ..
+            destination
+    end
+
+    return true, nil
+end
+
+--- Place un exemplaire d'un objet dans un emplacement précis.
+---@param itemName string
+---@param targetSlot number
+---@param lockedSlots table Slots déjà correctement préparés.
+---@return boolean
+---@return string|nil
+local function placeOneItem(itemName, targetSlot, lockedSlots)
+    if not isCraftingSlot(targetSlot) then
+        return false,
+            "Le slot " ..
+            tostring(targetSlot) ..
+            " ne fait pas partie de la grille de craft"
+    end
+
+    local targetItem = turtle.getItemDetail(targetSlot)
+
+    -- Le bon objet est déjà dans l'emplacement.
+    if targetItem and targetItem.name == itemName then
+        -- Un slot de recette ne doit contenir qu'un exemplaire.
+        if targetItem.count > 1 then
+            local destination = findDestination(itemName, lockedSlots)
+
+            if not destination then
+                return false,
+                    "Impossible de retirer le surplus de " .. itemName
+            end
+
+            turtle.select(targetSlot)
+
+            if not turtle.transferTo(destination, targetItem.count - 1) then
+                return false,
+                    "Impossible de retirer le surplus du slot " ..
+                    targetSlot
+            end
+        end
+
+        return true, nil
+    end
+
+    -- Un mauvais objet occupe l'emplacement cible.
+    if targetItem then
+        local excluded = {}
+
+        for slot, locked in pairs(lockedSlots) do
+            excluded[slot] = locked
+        end
+
+        excluded[targetSlot] = true
+
+        local moved, moveError = moveSlotAway(targetSlot, excluded)
+
+        if not moved then
+            return false, moveError
+        end
+    end
+
+    -- Recherche de l'ingrédient dans les autres slots.
+    local sourceSlot = inventory.findItem(itemName, lockedSlots)
+
+    if not sourceSlot then
+        return false, "Ingredient introuvable dans la turtle : " .. itemName
+    end
+
+    if sourceSlot == targetSlot then
+        return true, nil
+    end
+
+    turtle.select(sourceSlot)
+
+    if not turtle.transferTo(targetSlot, 1) then
+        return false,
+            "Impossible de placer " ..
+            itemName ..
+            " dans le slot " ..
+            targetSlot
+    end
+
+    return true, nil
+end
+
+--- Prépare la grille de craft à partir d'une recette.
+---
+--- Exemple :
+--- {
+---     [1] = items.PAIN,
+---     [5] = items.STEAK,
+---     [9] = items.PAIN
+--- }
+---
+---@param grid table<number, string>
+---@return boolean
+---@return string|nil
+function inventory.prepareCraftingGrid(grid)
+    if type(grid) ~= "table" then
+        return false, "La grille de recette est invalide"
+    end
+
+    local lockedSlots = {}
+
+    -- On traite les slots dans l'ordre afin d'obtenir un résultat prévisible.
+    for _, targetSlot in ipairs(CRAFTING_SLOTS) do
+        local itemName = grid[targetSlot]
+
+        if itemName then
+            local success, err =
+                placeOneItem(itemName, targetSlot, lockedSlots)
+
+            if not success then
+                return false, err
+            end
+
+            lockedSlots[targetSlot] = true
+        end
+    end
+
+    -- Les emplacements inutilisés de la grille doivent être vides.
+    for _, slot in ipairs(CRAFTING_SLOTS) do
+        if not grid[slot] and turtle.getItemCount(slot) > 0 then
+            local success, err = moveSlotAway(slot, lockedSlots)
+
+            if not success then
+                return false, err
+            end
+        end
+    end
+
+    -- Tous les slots hors grille doivent être vides avant turtle.craft().
+    for _, slot in ipairs(BUFFER_SLOTS) do
+        if turtle.getItemCount(slot) > 0 then
+            return false,
+                "Objet restant hors de la grille dans le slot " ..
+                slot ..
+                ". Verifie les quantites exportees."
+        end
+    end
+
+    return true, nil
+end
+
+--- Dépose tous les objets dans le coffre situé devant la turtle.
+---@return boolean
+---@return string|nil
+function inventory.dropAllFront()
+    for slot = 1, 16 do
+        local count = turtle.getItemCount(slot)
+
+        if count > 0 then
+            turtle.select(slot)
+
+            if not turtle.drop() then
+                return false,
+                    "Impossible de deposer le contenu du slot " ..
+                    slot ..
+                    " dans le coffre"
+            end
+        end
+    end
+
+    return true, nil
+end
+
+--- Vide la turtle dans le coffre situé devant.
+--- Cette fonction est utilisée avant de commencer une nouvelle fabrication.
+---@return boolean
+---@return string|nil
+function inventory.clear()
+    return inventory.dropAllFront()
+end
+
+--- Affiche le contenu actuel de la turtle.
+--- Utile pendant les tests.
+function inventory.printContents()
+    print("Contenu de la turtle :")
+
+    local empty = true
+
+    for slot = 1, 16 do
+        local item = turtle.getItemDetail(slot)
+
+        if item then
+            empty = false
+
+            print(
+                "Slot " ..
+                slot ..
+                " : " ..
+                item.name ..
+                " x" ..
+                item.count
+            )
+        end
+    end
+
+    if empty then
+        print("Inventaire vide")
+    end
+end
+
+function inventory.moveOneItem(itemName, targetSlot)
+    local result = inventory.findAllItems(itemName)
+
+    if result.total == 0 then
+        return false
+    end
+
+    for _, entry in ipairs(result.slots) do
+        if entry.slot ~= targetSlot then
+            turtle.select(entry.slot)
+            turtle.transferTo(targetSlot, 1)
+            turtle.select(1) -- Retour au slot 1 (optionnel)
+            return true
+        end
+    end
+
+    return false
+end
+
+function inventory.moveItems(itemName, targetSlot, amount)
+    if amount <= 0 then
+        return false, "Quantite invalide"
+    end
+
+    if targetSlot < 1 or targetSlot > 16 then
+        return false, "Slot cible invalide"
+    end
+
+    local targetItem = turtle.getItemDetail(targetSlot)
+
+    if targetItem and targetItem.name ~= itemName then
+        return false, "Le slot cible contient un autre objet"
+    end
+
+    local result = inventory.findAllItems(itemName)
+
+    local availableOutsideTarget = 0
+
+    for _, entry in ipairs(result.slots) do
+        if entry.slot ~= targetSlot then
+            availableOutsideTarget = availableOutsideTarget + entry.count
+        end
+    end
+
+    if availableOutsideTarget < amount then
+        return false, "Quantite insuffisante"
+    end
+
+    local remaining = amount
+
+    for _, entry in ipairs(result.slots) do
+        if remaining <= 0 then
+            break
+        end
+
+        if entry.slot ~= targetSlot then
+            local targetBefore = turtle.getItemCount(targetSlot)
+            local sourceBefore = turtle.getItemCount(entry.slot)
+
+            turtle.select(entry.slot)
+            turtle.transferTo(targetSlot, remaining)
+
+            local targetAfter = turtle.getItemCount(targetSlot)
+            local sourceAfter = turtle.getItemCount(entry.slot)
+
+            local movedToTarget = targetAfter - targetBefore
+            local movedFromSource = sourceBefore - sourceAfter
+            local actuallyMoved = math.min(movedToTarget, movedFromSource)
+
+            remaining = remaining - actuallyMoved
+
+            -- Le slot cible est plein : impossible d'y placer le reste.
+            if actuallyMoved == 0 or turtle.getItemSpace(targetSlot) == 0 then
+                break
+            end
+        end
+    end
+
+    turtle.select(1)
+
+    if remaining == 0 then
+        return true, "Objets deplaces"
+    end
+
+    return false, "Slot cible plein : " .. remaining .. " objet(s) non deplace(s)"
+end
+
+function inventory.getSlot(slot)
+    if slot < 1 or slot > 16 then
+        return nil
+    end
+
+    return turtle.getItemDetail(slot)
+end
+
+function inventory.findEmptySlot()
+    for slot = 1, 16 do
+        if turtle.getItemCount(slot) == 0 then
+            return slot
+        end
+    end
+
+    return nil
+end
+
+function inventory.clearSlot(slot)
+    if slot < 1 or slot > 16 then
+        return false, "Slot invalide"
+    end
+
+    local item = turtle.getItemDetail(slot)
+
+    if not item then
+        return true, "Le slot est deja vide"
+    end
+
+    local emptySlot = inventory.findEmptySlot()
+
+    if not emptySlot then
+        return false, "Aucun slot vide disponible"
+    end
+
+    if emptySlot == slot then
+        return true, "Le slot est deja vide"
+    end
+
+    turtle.select(slot)
+
+    local success = turtle.transferTo(emptySlot)
+
+    turtle.select(1)
+
+    if success then
+        return true, "Slot vide vers le slot " .. emptySlot
+    end
+
+    return false, "Impossible de vider le slot"
+end
+return inventory
+

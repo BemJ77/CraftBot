@@ -1,0 +1,119 @@
+local workers = {}
+
+local network = require("common.network")
+local protocol = require("common.protocol")
+
+function workers.discover(timeoutSeconds)
+    timeoutSeconds = timeoutSeconds or 3
+
+    network.broadcast({
+        type = protocol.TYPE.DISCOVER
+    })
+
+    local foundById = {}
+    local timer = os.startTimer(timeoutSeconds)
+
+    while true do
+        local event, p1, p2, p3 = os.pullEvent()
+
+        if event == "timer" and p1 == timer then
+            break
+        end
+
+        if event == "rednet_message" then
+            local senderId = p1
+            local message = p2
+            local receivedProtocol = p3
+
+            if receivedProtocol == protocol.NAME
+                and type(message) == "table"
+                and message.type == protocol.TYPE.DISCOVER_RESPONSE then
+
+                foundById[senderId] = {
+                    id = senderId,
+                    name =
+                        message.name
+                        or message.workerName
+                        or ("Cuistot " .. tostring(senderId)),
+                    busy = message.busy == true,
+                    status = message.busy == true and "busy" or "free",
+                    currentTask = nil
+                }
+            end
+        end
+    end
+
+    local result = {}
+
+    for _, worker in pairs(foundById) do
+        result[#result + 1] = worker
+    end
+
+    table.sort(result, function(a, b)
+        if a.busy ~= b.busy then
+            return not a.busy
+        end
+
+        return a.id < b.id
+    end)
+
+    return result
+end
+
+function workers.find(workerList, workerId)
+    for _, worker in ipairs(workerList or {}) do
+        if worker.id == workerId then
+            return worker
+        end
+    end
+
+    return nil
+end
+
+function workers.getFree(workerList)
+    for _, worker in ipairs(workerList or {}) do
+        if worker.status == "free" then
+            return worker
+        end
+    end
+
+    return nil
+end
+
+function workers.countFree(workerList)
+    local count = 0
+
+    for _, worker in ipairs(workerList or {}) do
+        if worker.status == "free" then
+            count = count + 1
+        end
+    end
+
+    return count
+end
+
+function workers.countBusy(workerList)
+    local count = 0
+
+    for _, worker in ipairs(workerList or {}) do
+        if worker.status == "busy" then
+            count = count + 1
+        end
+    end
+
+    return count
+end
+
+function workers.setBusy(worker, task)
+    worker.status = "busy"
+    worker.busy = true
+    worker.currentTask = task
+end
+
+function workers.setFree(worker)
+    worker.status = "free"
+    worker.busy = false
+    worker.currentTask = nil
+end
+
+return workers

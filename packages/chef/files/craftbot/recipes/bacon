@@ -1,0 +1,22 @@
+local items = require("items")
+ 
+return {
+    id = "bacon",
+    label = "bacon",
+ 
+    visible = false,
+
+    output = items.bacon,
+    outputCount = 2,
+ 
+    ingredients = {
+        [1] = items.mixing,
+        [2] = items.firmtofu,
+        [3] = items.saucesoja,
+        [5] = items.siroperable,
+    },
+
+	returns = {
+        items.mixing
+    }
+}

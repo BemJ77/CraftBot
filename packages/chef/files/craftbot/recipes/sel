@@ -1,0 +1,20 @@
+local items = require("items")
+ 
+return {
+    id = "sel",
+    label = "sel",
+ 
+    visible = false,
+    
+    output = items.sel,
+    outputCount = 1,
+ 
+    ingredients = {
+        [1] = items.pot,
+        [2] = items.eau,
+    },
+
+	returns = {
+        items.pot
+    }
+}

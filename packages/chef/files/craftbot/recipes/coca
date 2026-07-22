@@ -1,0 +1,23 @@
+local items = require("items")
+ 
+return {
+    id = "coca",
+    label = "coca",
+ 
+    visible = true,
+    category = "boissons",
+
+    output = items.coca,
+    outputCount = 1,
+ 
+    ingredients = {
+        [1] = items.pot,
+        [2] = items.eau,
+        [3] = items.sucre,
+        [5] = items.spiceleaf,
+    },
+
+	returns = {
+        items.pot
+    }
+}

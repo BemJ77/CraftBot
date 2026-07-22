@@ -1,0 +1,23 @@
+local items = require("items")
+ 
+return {
+    id = "menucomplet",
+    label = "menucomplet",
+ 
+    visible = true,
+    category = "burger",
+
+    output = items.menucomplet,
+    outputCount = 1,
+ 
+    ingredients = {
+        [1] = items.cutting,
+        [2] = items.mcpam,
+        [3] = items.coca,
+        [5] = items.frite,
+    },
+
+	returns = {
+        items.cutting
+    }
+}

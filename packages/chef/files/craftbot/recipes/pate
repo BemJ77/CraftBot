@@ -1,0 +1,22 @@
+local items = require("items")
+ 
+return {
+    id = "pate",
+    label = "pate",
+ 
+    visible = false,
+
+    output = items.pate,
+    outputCount = 2,
+ 
+    ingredients = {
+        [1] = items.mixing,
+        [2] = items.oeuf,
+        [3] = items.farine,
+        [5] = items.lait,
+    },
+
+	returns = {
+        items.mixing
+    }
+}

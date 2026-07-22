@@ -1,0 +1,255 @@
+-- craftbot/ae.lua
+-- Gestion de la communication avec le ME Bridge
+
+local ae = {}
+local BRIDGE_SIDE = "bottom"
+local TURTLE_SIDE = "up"
+local bridge = peripheral.wrap(BRIDGE_SIDE)
+
+local exportAuthorizer = nil
+local exportCommitter = nil
+
+if not bridge then
+    error("ME Bridge introuvable sur le cote : " .. BRIDGE_SIDE)
+end
+
+local bridgeType = peripheral.getType(BRIDGE_SIDE)
+
+if bridgeType ~= "me_bridge" then
+    error(
+        "Le peripherique situe sur " ..
+        BRIDGE_SIDE ..
+        " n'est pas un ME Bridge. Type detecte : " ..
+        tostring(bridgeType)
+    )
+end
+
+
+function ae.setExportReservationClient(authorizer, committer)
+    exportAuthorizer = authorizer
+    exportCommitter = committer
+end
+
+function ae.clearExportReservationClient()
+    exportAuthorizer = nil
+    exportCommitter = nil
+end
+
+function ae.getBridge()
+    return bridge
+end
+
+function ae.getItem(itemName)
+    if type(itemName) ~= "string" or itemName == "" then
+        return nil, "Identifiant d'objet invalide"
+    end
+
+    local success, result = pcall(function()
+        return bridge.getItem({
+            name = itemName
+        })
+    end)
+
+    if not success then
+        return nil, tostring(result)
+    end
+
+    return result, nil
+end
+
+function ae.getItemCount(itemName)
+    local item, err = ae.getItem(itemName)
+
+    if err then
+        return 0, err
+    end
+
+    if not item then
+        return 0, nil
+    end
+
+    return item.amount or item.count or 0, nil
+end
+
+function ae.hasItem(itemName, count)
+    count = count or 1
+
+    if count < 1 then
+        return false, 0, "La quantite demandee doit etre superieure a zero"
+    end
+
+    local currentCount, err = ae.getItemCount(itemName)
+
+    if err then
+        return false, 0, err
+    end
+
+    return currentCount >= count, currentCount, nil
+end
+
+function ae.exportItem(itemName, count)
+    count = count or 1
+
+    if type(itemName) ~= "string" or itemName == "" then
+        return 0, "Identifiant d'objet invalide"
+    end
+
+    if type(count) ~= "number" or count < 1 then
+        return 0, "Quantite invalide"
+    end
+
+    local grantId = nil
+
+    if exportAuthorizer then
+        local physicalStock, stockError = ae.getItemCount(itemName)
+
+        if stockError then
+            return 0,
+                "Impossible de lire le stock avant reservation : "
+                .. tostring(stockError)
+        end
+
+        local allowed, authorization, authorizationError =
+            exportAuthorizer(
+                itemName,
+                count,
+                physicalStock
+            )
+
+        if not allowed then
+            return 0,
+                authorizationError
+                or "Export refuse par le serveur"
+        end
+
+        grantId = authorization
+    end
+
+    local success, transferred, err = pcall(
+        bridge.exportItem,
+        {
+            name = itemName,
+            count = count
+        },
+        TURTLE_SIDE
+    )
+
+    if not success then
+        if exportCommitter and grantId then
+            pcall(exportCommitter, grantId, 0, itemName, count)
+        end
+
+        return 0, tostring(transferred)
+    end
+
+    transferred = tonumber(transferred) or 0
+
+    if exportCommitter and grantId then
+        local callOk, commitOk, commitError =
+            pcall(
+                exportCommitter,
+                grantId,
+                transferred,
+                itemName,
+                count
+            )
+
+        if not callOk then
+            return transferred,
+                "Export effectue, confirmation impossible : "
+                .. tostring(commitOk)
+        end
+
+        if commitOk == false then
+            return transferred,
+                "Export effectue, transaction non confirmee : "
+                .. tostring(commitError)
+        end
+    end
+
+    if transferred <= 0 and err == nil then
+        err = "Le ME Bridge n'a transfere aucun objet"
+    end
+
+    return transferred, err
+end
+
+function ae.exportIngredients(ingredients)
+    if type(ingredients) ~= "table" then
+        return false, "La liste des ingredients est invalide"
+    end
+
+    for itemName, requiredCount in pairs(ingredients) do
+        local available, currentCount, err =
+            ae.hasItem(itemName, requiredCount)
+
+        if err then
+            return false,
+                "Impossible de verifier " ..
+                itemName ..
+                " : " ..
+                tostring(err)
+        end
+
+        if not available then
+            return false,
+                "Stock insuffisant pour " ..
+                itemName ..
+                " : " ..
+                currentCount ..
+                "/" ..
+                requiredCount
+        end
+    end
+
+    for itemName, requiredCount in pairs(ingredients) do
+        local transferred, err =
+            ae.exportItem(itemName, requiredCount)
+
+        if transferred < requiredCount then
+            return false,
+                "Extraction incomplete pour " ..
+                itemName ..
+                " : " ..
+                transferred ..
+                "/" ..
+                requiredCount ..
+                (err and " - " .. tostring(err) or "")
+        end
+    end
+
+    return true, nil
+end
+
+function ae.importItem(itemName, count)
+    count = count or 1
+
+    if type(itemName) ~= "string" or itemName == "" then
+        return 0, "Identifiant d'objet invalide"
+    end
+
+    if type(count) ~= "number" or count < 1 then
+        return 0, "Quantite invalide"
+    end
+
+    local success, transferred, err = pcall(
+        bridge.importItem,
+        {
+            name = itemName,
+            count = count
+        },
+        TURTLE_SIDE
+    )
+
+    if not success then
+        return 0, tostring(transferred)
+    end
+
+    if transferred == nil then
+        return 0, err or "Le ME Bridge n'a retourne aucune quantite"
+    end
+
+    return transferred, err
+end
+
+return ae

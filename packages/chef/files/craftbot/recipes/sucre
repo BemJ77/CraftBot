@@ -1,0 +1,15 @@
+local items = require("items")
+ 
+return {
+    id = "sucre",
+    label = "sucre",
+ 
+    visible = false,
+    
+    output = items.sucre,
+    outputCount = 1,
+ 
+    ingredients = {
+        [1] = items.sugarcanne,
+    }
+}

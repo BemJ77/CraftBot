@@ -1,0 +1,20 @@
+local items = require("items")
+ 
+return {
+    id = "cacao",
+    label = "cacao",
+ 
+    visible = false,
+
+    output = items.cacao,
+    outputCount = 1,
+ 
+    ingredients = {
+        [1] = items.grinder,
+        [2] = items.fevecacao,
+    },
+
+	returns = {
+        items.grinder
+    }
+}

@@ -1,0 +1,605 @@
+local protocol = require("common.protocol")
+local network = require("common.network")
+
+local VERSION = "7.0.0"
+local HEARTBEAT_INTERVAL = 3
+local DISCOVERY_INTERVAL = 2
+local COMPLETED_DISPLAY_SECONDS = 15
+
+local serverId = nil
+local registered = false
+local registrationPending = false
+local orders = {}
+local running = true
+
+local output = term.current()
+local attachedMonitor = peripheral.find("monitor")
+
+if attachedMonitor then
+    attachedMonitor.setTextScale(0.5)
+    output = attachedMonitor
+end
+
+local function now()
+    return os.epoch("utc") / 1000
+end
+
+local function monitorName()
+    return os.getComputerLabel()
+        or ("moniteur" .. os.getComputerID())
+end
+
+local function send(receiverId, message)
+    return network.send(receiverId, message)
+end
+
+local function discoverServer()
+    registrationPending = true
+
+    network.broadcast(
+        protocol.makeMessage(
+            protocol.TYPE.SERVER_DISCOVER,
+            {
+                role = protocol.ROLE.MONITEUR,
+                name = monitorName(),
+                clientVersion = VERSION
+            }
+        )
+    )
+end
+
+local function register(targetId)
+    serverId = targetId
+    registrationPending = true
+
+    send(
+        serverId,
+        protocol.makeMessage(
+            protocol.TYPE.CLIENT_REGISTER,
+            {
+                role = protocol.ROLE.MONITEUR,
+                name = monitorName(),
+                clientVersion = VERSION,
+                status = "affichage"
+            }
+        )
+    )
+end
+
+local function heartbeat()
+    if not serverId or not registered then
+        return false
+    end
+
+    return send(
+        serverId,
+        protocol.makeMessage(
+            protocol.TYPE.HEARTBEAT,
+            {
+                role = protocol.ROLE.MONITEUR,
+                status = "affichage"
+            }
+        )
+    )
+end
+
+local function finalGroups(tasks)
+    local groups = {}
+    local ordered = {}
+
+    -- Création des lignes finales.
+    for _, task in ipairs(tasks or {}) do
+        if (tonumber(task.phase) or 0) == 0 then
+            local recipe = task.recipe or {}
+            local rootKey =
+                tostring(
+                    task.rootRecipeId
+                    or recipe.id
+                    or recipe.module
+                    or recipe.label
+                    or "inconnu"
+                )
+
+            local group = groups[rootKey]
+
+            if not group then
+                group = {
+                    key = rootKey,
+                    recipe = recipe,
+                    quantity = 0,
+                    current = 0,
+                    waiting = false,
+                    running = false,
+                    ready = false,
+                    failed = false,
+                    intermediateStarted = false,
+                    intermediateFailed = false
+                }
+
+                groups[rootKey] = group
+                ordered[#ordered + 1] = group
+            end
+
+            local quantity =
+                math.max(0, tonumber(task.quantity) or 0)
+            local current =
+                math.max(0, tonumber(task.current) or 0)
+            local total =
+                math.max(1, tonumber(task.total) or quantity or 1)
+
+            group.quantity = group.quantity + quantity
+
+            if task.status == "ready" then
+                group.current = group.current + quantity
+                group.ready = true
+            elseif task.status == "running" then
+                group.current =
+                    group.current
+                    + quantity
+                    * math.max(0, math.min(1, current / total))
+                group.running = true
+            elseif task.status == "failed" then
+                group.failed = true
+            else
+                group.waiting = true
+            end
+        end
+    end
+
+    -- Attribution exacte des sous-crafts grâce à rootRecipeId.
+    for _, task in ipairs(tasks or {}) do
+        if (tonumber(task.phase) or 0) > 0 then
+            local rootKey = tostring(task.rootRecipeId or "")
+            local group = groups[rootKey]
+
+            if group then
+                if task.status == "running"
+                    or task.status == "ready" then
+                    group.intermediateStarted = true
+                elseif task.status == "failed" then
+                    group.intermediateFailed = true
+                end
+            end
+        end
+    end
+
+    for _, group in ipairs(ordered) do
+        if group.failed or group.intermediateFailed then
+            group.status = "ERREUR"
+        elseif group.ready
+            and not group.running
+            and not group.waiting then
+            group.status = "PRET"
+            group.current = group.quantity
+        elseif group.running
+            or group.ready
+            or group.intermediateStarted then
+            group.status = "EN COURS"
+        else
+            group.status = "EN ATTENTE"
+        end
+
+        group.current =
+            math.max(0, math.min(group.current, group.quantity))
+    end
+
+    return ordered
+end
+
+local function statusColor(status)
+    if status == "finished" then
+        return colors.lime
+    elseif status == "failed" then
+        return colors.red
+    elseif status == "running" then
+        return colors.orange
+    end
+
+    return colors.lightGray
+end
+
+local function clearLine(y, width)
+    output.setCursorPos(1, y)
+    output.setBackgroundColor(colors.black)
+    output.write(string.rep(" ", width))
+end
+
+local function writeAt(
+    x,
+    y,
+    text,
+    foreground,
+    background
+)
+    local width, height = output.getSize()
+
+    if y < 1 or y > height or x > width then
+        return
+    end
+
+    text = tostring(text or "")
+    text = text:sub(1, math.max(0, width - x + 1))
+
+    output.setCursorPos(x, y)
+    output.setBackgroundColor(background or colors.black)
+    output.setTextColor(foreground or colors.white)
+    output.write(text)
+    output.setBackgroundColor(colors.black)
+end
+
+local function fillRect(x, y, width, height, background)
+    local screenWidth, screenHeight = output.getSize()
+
+    width = math.max(0, math.min(width, screenWidth - x + 1))
+    height = math.max(0, math.min(height, screenHeight - y + 1))
+
+    output.setBackgroundColor(background or colors.gray)
+
+    for row = 0, height - 1 do
+        output.setCursorPos(x, y + row)
+        output.write(string.rep(" ", width))
+    end
+
+    output.setBackgroundColor(colors.black)
+end
+
+local function drawBox(x, y, width, height)
+    local border = colors.lightGray
+    local fill = colors.gray
+
+    fillRect(x, y, width, height, fill)
+
+    output.setBackgroundColor(fill)
+    output.setTextColor(border)
+
+    if width >= 2 and height >= 2 then
+        output.setCursorPos(x, y)
+        output.write("+" .. string.rep("-", width - 2) .. "+")
+
+        for row = 1, height - 2 do
+            output.setCursorPos(x, y + row)
+            output.write("|")
+            output.setCursorPos(x + width - 1, y + row)
+            output.write("|")
+        end
+
+        output.setCursorPos(x, y + height - 1)
+        output.write("+" .. string.rep("-", width - 2) .. "+")
+    end
+
+    output.setBackgroundColor(colors.black)
+end
+
+local function drawProgressBar(
+    x,
+    y,
+    width,
+    percent,
+    panelBackground
+)
+    percent = math.max(0, math.min(100, tonumber(percent) or 0))
+    width = math.max(3, width)
+    panelBackground = panelBackground or colors.gray
+
+    local innerWidth = width - 2
+    local filled = math.floor(innerWidth * percent / 100)
+
+    output.setCursorPos(x, y)
+    output.setBackgroundColor(panelBackground)
+    output.setTextColor(colors.lightGray)
+    output.write("[")
+
+    if filled > 0 then
+        output.setBackgroundColor(colors.lime)
+        output.write(string.rep(" ", filled))
+    end
+
+    local remaining = innerWidth - filled
+
+    if remaining > 0 then
+        output.setBackgroundColor(panelBackground)
+        output.write(string.rep(" ", remaining))
+    end
+
+    output.setBackgroundColor(panelBackground)
+    output.setTextColor(colors.lightGray)
+    output.write("]")
+    output.setBackgroundColor(colors.black)
+end
+
+local function draw()
+    local width, height = output.getSize()
+
+    output.setBackgroundColor(colors.black)
+    output.clear()
+
+    local title = "CRAFTBOT - SUIVI DES COMMANDES"
+
+    writeAt(
+        math.max(1, math.floor((width - #title) / 2) + 1),
+        1,
+        title,
+        colors.lime
+    )
+
+    writeAt(
+        2,
+        3,
+        "Serveur : "
+            .. (
+                registered
+                and "EN LIGNE"
+                or "RECHERCHE..."
+            ),
+        registered and colors.lime or colors.orange
+    )
+
+    local active = {}
+
+    for _, order in pairs(orders) do
+        local keep =
+            order.status ~= "finished"
+            and order.status ~= "failed"
+
+        if not keep and order.completedAt then
+            keep =
+                now() - order.completedAt
+                <= COMPLETED_DISPLAY_SECONDS
+        end
+
+        if keep then
+            active[#active + 1] = order
+        end
+    end
+
+    table.sort(
+        active,
+        function(a, b)
+            return tonumber(a.orderId) < tonumber(b.orderId)
+        end
+    )
+
+    writeAt(
+        math.max(2, width - 18),
+        3,
+        "Commandes : " .. tostring(#active),
+        colors.cyan
+    )
+
+    if #active == 0 then
+        writeAt(2, 5, "Aucune commande en cours", colors.gray)
+        return
+    end
+
+    local y = 5
+
+    for _, order in ipairs(active) do
+        local groups = finalGroups(order.tasks)
+        local contentLines = math.max(1, #groups)
+        local boxHeight = 4 + contentLines
+
+        if y + boxHeight - 1 > height then
+            break
+        end
+
+        local boxX = 2
+        local boxWidth = width - 2
+
+        drawBox(boxX, y, boxWidth, boxHeight)
+
+        local percent = tonumber(order.progress) or 0
+        local heading =
+            tostring(order.orderNumber or ("#" .. order.orderId))
+            .. "  "
+            .. tostring(percent)
+            .. "%"
+
+        writeAt(
+            boxX + 2,
+            y + 1,
+            heading,
+            statusColor(order.status),
+            colors.gray
+        )
+
+        local orderState =
+            order.status == "finished"
+            and "PRETE"
+            or order.status == "failed"
+            and "ERREUR"
+            or order.status == "running"
+            and "EN COURS"
+            or "EN ATTENTE"
+
+        writeAt(
+            math.max(
+                boxX + 2,
+                boxX + boxWidth - #orderState - 2
+            ),
+            y + 1,
+            orderState,
+            statusColor(order.status),
+            colors.gray
+        )
+
+        local barX = boxX + 2
+        local barWidth = math.max(8, boxWidth - 4)
+
+        drawProgressBar(
+            barX,
+            y + 2,
+            barWidth,
+            percent,
+            colors.gray
+        )
+
+        local rowY = y + 3
+
+        for _, group in ipairs(groups) do
+            local label =
+                tostring(
+                    group.recipe.label
+                    or group.recipe.id
+                    or "Produit"
+                )
+                .. " x"
+                .. tostring(group.quantity)
+
+            if group.status == "EN COURS" then
+                label =
+                    label
+                    .. " ("
+                    .. tostring(math.floor(group.current + 0.5))
+                    .. "/"
+                    .. tostring(group.quantity)
+                    .. ")"
+            end
+
+            writeAt(
+                boxX + 3,
+                rowY,
+                label,
+                colors.white,
+                colors.gray
+            )
+
+            writeAt(
+                math.max(
+                    boxX + 3,
+                    boxX + boxWidth - #group.status - 2
+                ),
+                rowY,
+                group.status,
+                group.status == "PRET"
+                    and colors.lime
+                    or group.status == "ERREUR"
+                    and colors.red
+                    or group.status == "EN COURS"
+                    and colors.orange
+                    or colors.yellow,
+                colors.gray
+            )
+
+            rowY = rowY + 1
+        end
+
+        y = y + boxHeight + 1
+    end
+end
+
+local function updateOrder(message)
+    local data = message.data or message
+    local orderId = tonumber(data.orderId)
+
+    if not orderId then
+        return
+    end
+
+    local order = orders[orderId] or {}
+
+    for key, value in pairs(data) do
+        order[key] = value
+    end
+
+    order.orderId = orderId
+
+    if message.type == protocol.TYPE.ORDER_FINISHED then
+        order.status = "finished"
+        order.progress = 100
+        order.completedAt = now()
+    elseif message.type == protocol.TYPE.ORDER_FAILED then
+        order.status = "failed"
+        order.completedAt = now()
+    end
+
+    orders[orderId] = order
+    draw()
+end
+
+local function networkLoop()
+    while running do
+        local senderId, message = network.receive(1)
+
+        if senderId and type(message) == "table" then
+            local data = message.data or message
+
+            if message.type == protocol.TYPE.SERVER_ANNOUNCE then
+                if not registered then
+                    register(senderId)
+                end
+
+            elseif message.type == protocol.TYPE.CLIENT_REGISTERED
+                and senderId == serverId then
+
+                if data.accepted then
+                    registered = true
+                    registrationPending = false
+                    draw()
+                else
+                    registered = false
+                    registrationPending = false
+                end
+
+            elseif senderId == serverId
+                and (
+                    message.type == protocol.TYPE.ORDER_ACCEPTED
+                    or message.type == protocol.TYPE.ORDER_UPDATE
+                    or message.type == protocol.TYPE.ORDER_FINISHED
+                    or message.type == protocol.TYPE.ORDER_FAILED
+                ) then
+
+                updateOrder(message)
+
+            elseif message.type == protocol.TYPE.HEARTBEAT_ACK then
+                -- confirmation silencieuse
+            end
+        end
+    end
+end
+
+local function heartbeatLoop()
+    local failures = 0
+
+    while running do
+        if registered and serverId then
+            local ok, sent = pcall(heartbeat)
+
+            if ok and sent then
+                failures = 0
+            else
+                failures = failures + 1
+            end
+
+            if failures >= 3 then
+                registered = false
+                registrationPending = false
+                serverId = nil
+                failures = 0
+                draw()
+            end
+        elseif not registrationPending then
+            discoverServer()
+        end
+
+        sleep(
+            registered
+                and HEARTBEAT_INTERVAL
+                or DISCOVERY_INTERVAL
+        )
+    end
+end
+
+local opened, modemSide = network.open()
+
+if not opened then
+    printError(tostring(modemSide))
+    return
+end
+
+draw()
+discoverServer()
+
+parallel.waitForAny(
+    networkLoop,
+    heartbeatLoop
+)

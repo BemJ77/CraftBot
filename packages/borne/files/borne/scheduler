@@ -1,0 +1,290 @@
+local scheduler = {}
+
+local function findWorker(workerList, workerId)
+    for _, worker in ipairs(workerList or {}) do
+        if worker.id == workerId then
+            return worker
+        end
+    end
+
+    return nil
+end
+
+local function findWaitingTask(tasks)
+    for _, task in ipairs(tasks or {}) do
+        if task.status == "waiting" then
+            return task
+        end
+    end
+
+    return nil
+end
+
+local function extractProgress(message, defaultTotal)
+    local current = tonumber(message.current)
+    local total = tonumber(message.total)
+
+    if current and total and total > 0 then
+        return current, total
+    end
+
+    local text = tostring(message.message or "")
+    local parsedCurrent, parsedTotal =
+        text:match("(%d+)%s*/%s*(%d+)")
+
+    parsedCurrent = tonumber(parsedCurrent)
+    parsedTotal = tonumber(parsedTotal)
+
+    if parsedCurrent and parsedTotal and parsedTotal > 0 then
+        return parsedCurrent, parsedTotal
+    end
+
+    return 0, defaultTotal
+end
+
+function scheduler.create(workerList, cart, orderNumber)
+    local instance = {
+        workers = workerList or {},
+        tasks = {},
+        orderNumber = orderNumber,
+        lastMessage = "Preparation de la commande...",
+        failed = false,
+        error = nil
+    }
+
+    local cartItems = cart or {}
+    local workerCount = math.max(1, #instance.workers)
+    local splitLines = {}
+
+    -- Chaque ligne de commande est decoupee en plusieurs taches.
+    -- Le nombre de morceaux est limite par :
+    --   - la quantite commandee ;
+    --   - le nombre de cuistots.
+    --
+    -- Exemples avec 3 cuistots :
+    --   7 burgers  -> 3 + 2 + 2
+    --   2 frites   -> 1 + 1
+    --   1 boisson  -> 1
+    for lineIndex, item in ipairs(cartItems) do
+        local quantity = math.max(1, tonumber(item.quantity) or 1)
+        local taskCount = math.min(quantity, workerCount)
+        local baseQuantity = math.floor(quantity / taskCount)
+        local remainder = quantity % taskCount
+
+        splitLines[lineIndex] = {}
+
+        for splitIndex = 1, taskCount do
+            local splitQuantity = baseQuantity
+
+            if splitIndex <= remainder then
+                splitQuantity = splitQuantity + 1
+            end
+
+            splitLines[lineIndex][splitIndex] = {
+                id =
+                    tostring(orderNumber)
+                    .. "-"
+                    .. tostring(lineIndex)
+                    .. "-"
+                    .. tostring(splitIndex),
+
+                recipe = item.recipe,
+                quantity = splitQuantity,
+                status = "waiting",
+                workerId = nil,
+                workerName = nil,
+                current = 0,
+                total = splitQuantity,
+                error = nil,
+                lineIndex = lineIndex,
+                splitIndex = splitIndex
+            }
+        end
+    end
+
+    -- Les morceaux sont intercales entre les lignes.
+    -- Cela evite que tous les cuistots commencent forcement par
+    -- la premiere ligne de la commande.
+    --
+    -- Exemple :
+    --   Burger 1, Frites 1, Burger 2, Frites 2...
+    local splitIndex = 1
+    local hasMoreTasks = true
+
+    while hasMoreTasks do
+        hasMoreTasks = false
+
+        for lineIndex = 1, #splitLines do
+            local task = splitLines[lineIndex][splitIndex]
+
+            if task then
+                table.insert(instance.tasks, task)
+                hasMoreTasks = true
+            end
+        end
+
+        splitIndex = splitIndex + 1
+    end
+
+    return instance
+end
+
+function scheduler.dispatch(instance, network, protocol)
+    local dispatched = 0
+
+    for _, worker in ipairs(instance.workers) do
+        if worker.status == "free" then
+            local task = findWaitingTask(instance.tasks)
+
+            if not task then
+                break
+            end
+
+            local sent, sendError = network.send(
+                worker.id,
+                {
+                    type = protocol.TYPE.CRAFT_REQUEST,
+                    taskId = task.id,
+                    orderNumber = instance.orderNumber,
+                    recipe = task.recipe.id,
+                    quantity = task.quantity
+                }
+            )
+
+            if not sent then
+                task.status = "failed"
+                task.error = tostring(sendError)
+                instance.failed = true
+                instance.error =
+                    tostring(task.recipe.label or task.recipe.id)
+                    .. " : "
+                    .. tostring(sendError)
+
+                return false, instance.error
+            end
+
+            worker.status = "busy"
+            worker.busy = true
+            worker.currentTask = task
+
+            task.status = "running"
+            task.workerId = worker.id
+            task.workerName =
+                worker.name or ("Cuistot " .. tostring(worker.id))
+
+            instance.lastMessage =
+                task.workerName
+                .. " prepare "
+                .. tostring(task.recipe.label or task.recipe.id)
+
+            dispatched = dispatched + 1
+        end
+    end
+
+    return true, dispatched
+end
+
+function scheduler.handleMessage(instance, senderId, message, protocol)
+    if type(message) ~= "table" then
+        return false
+    end
+
+    local worker = findWorker(instance.workers, senderId)
+
+    if not worker or not worker.currentTask then
+        return false
+    end
+
+    local task = worker.currentTask
+
+    if message.type == protocol.TYPE.PROGRESS then
+        local current, total =
+            extractProgress(message, task.quantity)
+
+        task.current = math.max(0, current)
+        task.total = math.max(1, total)
+
+        instance.lastMessage =
+            message.message
+            or (
+                task.workerName
+                .. " prepare "
+                .. tostring(task.recipe.label or task.recipe.id)
+            )
+
+        return true
+    end
+
+    if message.type == protocol.TYPE.FINISHED then
+        if message.success then
+            task.status = "ready"
+            task.current = task.quantity
+            task.total = task.quantity
+
+            instance.lastMessage =
+                tostring(task.recipe.label or task.recipe.id)
+                .. " pret par "
+                .. tostring(task.workerName)
+        else
+            task.status = "failed"
+            task.error =
+                message.error or "Une erreur est survenue"
+
+            instance.failed = true
+            instance.error =
+                tostring(task.recipe.label or task.recipe.id)
+                .. " - "
+                .. tostring(task.workerName)
+                .. " : "
+                .. tostring(task.error)
+        end
+
+        worker.status = "free"
+        worker.busy = false
+        worker.currentTask = nil
+
+        return true
+    end
+
+    return false
+end
+
+function scheduler.isFinished(instance)
+    if instance.failed then
+        return false
+    end
+
+    for _, task in ipairs(instance.tasks) do
+        if task.status ~= "ready" then
+            return false
+        end
+    end
+
+    return true
+end
+
+function scheduler.hasRunningTasks(instance)
+    for _, task in ipairs(instance.tasks) do
+        if task.status == "running" then
+            return true
+        end
+    end
+
+    return false
+end
+
+function scheduler.hasWaitingTasks(instance)
+    for _, task in ipairs(instance.tasks) do
+        if task.status == "waiting" then
+            return true
+        end
+    end
+
+    return false
+end
+
+function scheduler.getTasks(instance)
+    return instance.tasks
+end
+
+return scheduler

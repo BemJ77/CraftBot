@@ -1,0 +1,26 @@
+local items = require("items")
+ 
+return {
+    id = "deluxeburger",
+    label = "deluxeburger",
+ 
+    visible = true,
+    category = "burger",
+
+    output = items.deluxeburger,
+    outputCount = 1,
+ 
+    ingredients = {
+        [1] = items.skillet,
+        [2] = items.pain,
+        [3] = items.groundbeef,
+        [5] = items.silkentofu,
+        [6] = items.salade,
+        [7] = items.saucesoja,
+        [9] = items.oignon,
+    },
+
+	returns = {
+        items.skillet
+    }
+}

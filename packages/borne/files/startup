@@ -1,0 +1,14 @@
+term.clear()
+term.setCursorPos(1,1)
+
+print("Demarrage CraftBot...")
+
+local ok, err = pcall(function()
+    shell.run("borne/terminal")
+end)
+
+if not ok then
+    print()
+    print("Erreur :")
+    print(err)
+end

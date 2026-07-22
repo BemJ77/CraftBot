@@ -1,0 +1,171 @@
+local network = require("common.network")
+
+local manager = {}
+
+-- V6.3.1 : toutes les boucles doivent être actives dès leur
+-- lancement. Sinon dispatchLoop peut se terminer avant receiveLoop.
+local running = true
+local defaultHandler = nil
+local typeHandlers = {}
+local inboundQueues = {}
+local responseByRequestId = {}
+
+local function queueFor(messageType)
+    local key = tostring(messageType or "__unknown__")
+
+    if not inboundQueues[key] then
+        inboundQueues[key] = {}
+    end
+
+    return inboundQueues[key]
+end
+
+local function push(queue, value)
+    queue[#queue + 1] = value
+end
+
+local function pop(queue)
+    if #queue == 0 then
+        return nil
+    end
+
+    return table.remove(queue, 1)
+end
+
+function manager.setDefaultHandler(handler)
+    defaultHandler = handler
+end
+
+function manager.on(messageType, handler)
+    typeHandlers[tostring(messageType)] = handler
+end
+
+function manager.send(receiverId, message)
+    return network.send(receiverId, message)
+end
+
+function manager.broadcast(message)
+    return network.broadcast(message)
+end
+
+function manager.open()
+    return network.open()
+end
+
+function manager.start()
+    running = true
+end
+
+function manager.stop()
+    running = false
+end
+
+function manager.waitForResponse(requestId, timeoutSeconds)
+    local key = tostring(requestId)
+    local timeout = tonumber(timeoutSeconds) or 5
+    local timerId = os.startTimer(timeout)
+
+    while true do
+        local queued = responseByRequestId[key]
+
+        if queued then
+            responseByRequestId[key] = nil
+            return queued.senderId, queued.message, nil
+        end
+
+        local event, value = os.pullEvent()
+
+        if event == "craftbot_network_response"
+            and tostring(value) == key then
+
+            local response = responseByRequestId[key]
+
+            if response then
+                responseByRequestId[key] = nil
+                return response.senderId, response.message, nil
+            end
+
+        elseif event == "timer" and value == timerId then
+            responseByRequestId[key] = nil
+            return nil, nil, "Delai de reponse depasse"
+        end
+    end
+end
+
+function manager.receiveLoop()
+    while running do
+        local senderId, message = network.receive(1)
+
+        if senderId and type(message) == "table" then
+            local data = message.data or message
+            local requestId = data.requestId
+
+            if requestId ~= nil then
+                local key = tostring(requestId)
+
+                responseByRequestId[key] = {
+                    senderId = senderId,
+                    message = message,
+                    receivedAt = os.epoch("utc")
+                }
+
+                os.queueEvent(
+                    "craftbot_network_response",
+                    key
+                )
+            else
+                local messageType =
+                    tostring(message.type or "__unknown__")
+
+                push(
+                    queueFor(messageType),
+                    {
+                        senderId = senderId,
+                        message = message
+                    }
+                )
+
+                os.queueEvent(
+                    "craftbot_network_message",
+                    messageType
+                )
+            end
+        end
+    end
+end
+
+function manager.dispatchLoop()
+    while running do
+        local event = os.pullEvent()
+
+        if event == "craftbot_network_message" then
+            for messageType, queue in pairs(inboundQueues) do
+                while #queue > 0 do
+                    local envelope = pop(queue)
+                    local handler =
+                        typeHandlers[messageType]
+                        or defaultHandler
+
+                    if handler then
+                        local ok, err = pcall(
+                            handler,
+                            envelope.senderId,
+                            envelope.message
+                        )
+
+                        if not ok then
+                            printError(
+                                "Erreur gestion message "
+                                    .. tostring(messageType)
+                                    .. " : "
+                                    .. tostring(err)
+                            )
+                        end
+                    end
+                end
+            end
+        end
+    end
+end
+
+return manager

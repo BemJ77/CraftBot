@@ -1,0 +1,252 @@
+local recipeManager = {}
+
+------------------------------------------------------------
+-- Configuration
+------------------------------------------------------------
+
+local RECIPES_DIRECTORY = "/craftbot/recipes"
+
+------------------------------------------------------------
+-- Charge une recette
+------------------------------------------------------------
+
+function recipeManager.load(recipeName)
+
+    if type(recipeName) ~= "string"
+        or recipeName == "" then
+
+        return nil, "Nom de recette invalide"
+    end
+
+    local moduleName =
+        RECIPES_DIRECTORY .. "." .. recipeName
+
+    local ok, recipe =
+        pcall(require, moduleName)
+
+    if not ok then
+        return nil, tostring(recipe)
+    end
+
+    if type(recipe) ~= "table" then
+        return nil,
+            "La recette "
+            .. recipeName
+            .. " ne retourne pas une table"
+    end
+
+    return recipe
+end
+
+------------------------------------------------------------
+-- Vérifie si une recette existe
+------------------------------------------------------------
+
+function recipeManager.exists(recipeName)
+
+    local recipe =
+        recipeManager.load(recipeName)
+
+    return recipe ~= nil
+end
+
+------------------------------------------------------------
+-- Retourne les noms de tous les fichiers de recettes
+------------------------------------------------------------
+
+function recipeManager.all()
+
+    if not fs.exists(RECIPES_DIRECTORY) then
+        return nil,
+            "Le dossier des recettes est introuvable"
+    end
+
+    if not fs.isDir(RECIPES_DIRECTORY) then
+        return nil,
+            "Le chemin recipes n'est pas un dossier"
+    end
+
+    local files =
+        fs.list(RECIPES_DIRECTORY)
+
+    local result = {}
+
+    for _, fileName in ipairs(files) do
+
+        local fullPath =
+            fs.combine(
+                RECIPES_DIRECTORY,
+                fileName
+            )
+
+        if not fs.isDir(fullPath) then
+
+            local recipeName =
+                fileName:gsub("%.lua$", "")
+
+            table.insert(
+                result,
+                recipeName
+            )
+        end
+    end
+
+    table.sort(result)
+
+    return result
+end
+
+------------------------------------------------------------
+-- Retourne uniquement les recettes visibles
+------------------------------------------------------------
+
+function recipeManager.list()
+
+    local recipeNames, err =
+        recipeManager.all()
+
+    if not recipeNames then
+        return nil, err
+    end
+
+    local result = {}
+
+    for _, recipeName in ipairs(recipeNames) do
+
+        local recipe, loadError =
+            recipeManager.load(recipeName)
+
+        if recipe then
+
+            if recipe.visible ~= false then
+
+                table.insert(
+                    result,
+                    {
+                        id =
+                            recipe.id
+                            or recipeName,
+
+                        label =
+                            recipe.label
+                            or recipe.id
+                            or recipeName,
+
+                        category =
+                            recipe.category
+                            or "autres"
+                    }
+                )
+            end
+
+        else
+            printError(
+                "Recette ignoree : "
+                .. recipeName
+                .. " - "
+                .. tostring(loadError)
+            )
+        end
+    end
+
+    table.sort(
+        result,
+        function(a, b)
+
+            local categoryA =
+                string.lower(
+                    tostring(a.category)
+                )
+
+            local categoryB =
+                string.lower(
+                    tostring(b.category)
+                )
+
+            if categoryA == categoryB then
+
+                return string.lower(
+                    tostring(a.label)
+                ) < string.lower(
+                    tostring(b.label)
+                )
+            end
+
+            return categoryA < categoryB
+        end
+    )
+
+    return result
+end
+
+------------------------------------------------------------
+-- Catalogue complet pour le scheduler central
+------------------------------------------------------------
+
+function recipeManager.catalog()
+    local recipeNames, err = recipeManager.all()
+
+    if not recipeNames then
+        return nil, err
+    end
+
+    local result = {}
+
+    for _, recipeName in ipairs(recipeNames) do
+        local recipe, loadError = recipeManager.load(recipeName)
+
+        if recipe then
+            local ingredients = {}
+
+            for slot, itemName in pairs(recipe.ingredients or {}) do
+                table.insert(
+                    ingredients,
+                    {
+                        slot = slot,
+                        item = itemName
+                    }
+                )
+            end
+
+            table.sort(
+                ingredients,
+                function(a, b)
+                    return tonumber(a.slot) < tonumber(b.slot)
+                end
+            )
+
+            table.insert(
+                result,
+                {
+                    id = recipe.id or recipeName,
+                    module = recipeName,
+                    label = recipe.label or recipe.id or recipeName,
+                    category = recipe.category or "autres",
+                    visible = recipe.visible ~= false,
+                    output = recipe.output,
+                    outputCount = tonumber(recipe.outputCount) or 1,
+                    ingredients = ingredients,
+                    returns = recipe.returns or {}
+                }
+            )
+        else
+            printError(
+                "Recette ignoree dans le catalogue : "
+                    .. recipeName
+                    .. " - "
+                    .. tostring(loadError)
+            )
+        end
+    end
+
+    table.sort(
+        result,
+        function(a, b)
+            return tostring(a.id) < tostring(b.id)
+        end
+    )
+
+    return result
+end
+
+return recipeManager

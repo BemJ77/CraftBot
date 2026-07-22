@@ -1,0 +1,6 @@
+local crafter = require("crafter")
+
+local success, message =
+    crafter.craftRecipe("donutchoco")
+
+print(success, message)

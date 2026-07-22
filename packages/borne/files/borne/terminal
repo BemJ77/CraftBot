@@ -1,0 +1,1377 @@
+local logger = require("logger")
+local network = require("common.network")
+local protocol = require("common.protocol")
+local gui = require("gui")
+
+local DISCOVERY_TIMEOUT = 5
+local RECIPES_TIMEOUT = 8
+local BORNE_VERSION = "7.0.0"
+
+local state = {
+    serverId = nil,
+    serverName = nil,
+    registered = false,
+    recipes = {},
+    categories = {},
+    selectedCategory = nil,
+    selectedRecipe = nil,
+    quantity = 1,
+    cart = {}
+}
+
+------------------------------------------------------------
+-- Réseau
+------------------------------------------------------------
+
+local function waitForMessage(timeoutSeconds, predicate)
+    local timer = os.startTimer(timeoutSeconds)
+
+    while true do
+        local event, p1, p2, p3 = os.pullEvent()
+
+        if event == "timer" and p1 == timer then
+            return nil, nil, "Delai d'attente depasse"
+        end
+
+        if event == "rednet_message" then
+            local senderId = p1
+            local message = p2
+            local receivedProtocol = p3
+
+            if receivedProtocol == protocol.NAME
+                and type(message) == "table"
+                and predicate(senderId, message) then
+
+                return senderId, message
+            end
+        end
+    end
+end
+
+local function borneName()
+    return os.getComputerLabel() or ("Borne " .. tostring(os.getComputerID()))
+end
+
+local function discoverServer()
+    gui.status("CraftBot", "Recherche du serveur...", colors.yellow,
+        "Connexion au restaurant")
+
+    network.broadcast(protocol.makeMessage(protocol.TYPE.SERVER_DISCOVER, {
+        role = protocol.ROLE.TERMINAL,
+        id = os.getComputerID(),
+        name = borneName()
+    }))
+
+    local senderId, message, receiveError = waitForMessage(
+        DISCOVERY_TIMEOUT,
+        function(_, receivedMessage)
+            return receivedMessage.type == protocol.TYPE.SERVER_ANNOUNCE
+        end
+    )
+
+    if not message then return false, receiveError or "Serveur introuvable" end
+
+    local data = message.data or message
+    state.serverId = tonumber(data.id) or senderId
+    state.serverName = data.name or ("Serveur " .. tostring(state.serverId))
+
+    network.send(state.serverId, protocol.makeMessage(
+        protocol.TYPE.CLIENT_REGISTER, {
+            role = protocol.ROLE.TERMINAL,
+            id = os.getComputerID(),
+            name = borneName(),
+            clientVersion = BORNE_VERSION
+        }
+    ))
+
+    local _, registration, registrationError = waitForMessage(
+        DISCOVERY_TIMEOUT,
+        function(id, receivedMessage)
+            return id == state.serverId
+                and receivedMessage.type == protocol.TYPE.CLIENT_REGISTERED
+        end
+    )
+
+    if not registration then return false, registrationError end
+    local registrationData = registration.data or registration
+    if not registrationData.accepted then
+        return false, registrationData.reason or "Inscription refusee"
+    end
+
+    state.registered = true
+    gui.status("CraftBot", "Serveur connecte", colors.lime, state.serverName)
+    sleep(1)
+    return true
+end
+
+local function requestRecipes()
+    gui.status("CraftBot", "Chargement des recettes...", colors.yellow,
+        state.serverName or "Serveur")
+
+    local sent, sendError = network.send(state.serverId, {
+        type = protocol.TYPE.RECIPES_REQUEST
+    })
+    if not sent then return false, sendError end
+
+    local _, message, receiveError = waitForMessage(
+        RECIPES_TIMEOUT,
+        function(senderId, receivedMessage)
+            return senderId == state.serverId
+                and receivedMessage.type == protocol.TYPE.RECIPES_RESPONSE
+        end
+    )
+    if not message then return false, receiveError end
+    if message.success == false then
+        return false, message.error or "Recettes refusees par le serveur"
+    end
+    if type(message.recipes) ~= "table" then
+        return false, "Liste des recettes invalide"
+    end
+    state.recipes = message.recipes
+    return true
+end
+
+------------------------------------------------------------
+-- Recettes et catégories
+------------------------------------------------------------
+
+local function buildCategories()
+    local grouped = {}
+
+    for _, recipe in ipairs(state.recipes) do
+        if type(recipe) == "table" and recipe.id then
+            local categoryName =
+                tostring(recipe.category or "Autres")
+
+            if not grouped[categoryName] then
+                grouped[categoryName] = {}
+            end
+
+            grouped[categoryName][#grouped[categoryName] + 1] =
+                recipe
+        end
+    end
+
+    state.categories = {}
+
+    for categoryName, recipes in pairs(grouped) do
+        table.sort(recipes, function(a, b)
+            return string.lower(tostring(a.label or a.id))
+                < string.lower(tostring(b.label or b.id))
+        end)
+
+        state.categories[#state.categories + 1] = {
+            name = categoryName,
+            recipes = recipes
+        }
+    end
+
+    table.sort(state.categories, function(a, b)
+        return string.lower(a.name) < string.lower(b.name)
+    end)
+end
+
+------------------------------------------------------------
+-- Panier
+------------------------------------------------------------
+
+local function getCartArticleCount()
+    local count = 0
+
+    for _, item in ipairs(state.cart) do
+        count = count + item.quantity
+    end
+
+    return count
+end
+
+local function getCartLineCount()
+    return #state.cart
+end
+
+local function addToCart(recipe, quantity)
+    for _, item in ipairs(state.cart) do
+        if item.recipe.id == recipe.id then
+            item.quantity = item.quantity + quantity
+            return
+        end
+    end
+
+    state.cart[#state.cart + 1] = {
+        recipe = recipe,
+        quantity = quantity
+    }
+end
+
+local function removeFromCart(itemToRemove)
+    for index, item in ipairs(state.cart) do
+        if item == itemToRemove then
+            table.remove(state.cart, index)
+            return
+        end
+    end
+end
+
+local function drawCartButton()
+    local width, height = gui.getSize()
+    local count = getCartArticleCount()
+    local label = "PANIER [" .. tostring(count) .. "]"
+    local buttonWidth = math.min(14, math.max(10, #label + 2))
+
+    gui.button(
+        "cart",
+        width - buttonWidth + 1,
+        height - 4,
+        buttonWidth,
+        3,
+        label,
+        {
+            backgroundColor = gui.theme.accent,
+            textColor = colors.black
+        }
+    )
+end
+
+local function getKitchenStatusText()
+    if state.registered then
+        return "SERVEUR CONNECTE"
+    end
+
+    return "SERVEUR HORS LIGNE"
+end
+
+------------------------------------------------------------
+-- Listes tactiles
+------------------------------------------------------------
+
+local function drawPagedList(
+    title,
+    subtitle,
+    items,
+    labelFunction,
+    page,
+    showBack
+)
+    gui.clear(gui.theme.background)
+    gui.topBar(
+        "CraftBot",
+        subtitle or title,
+        getKitchenStatusText(),
+        gui.theme.success
+    )
+
+    local width, height = gui.getSize()
+    local firstY = 5
+    local buttonHeight = 3
+    local gap = 1
+
+    -- Réserve de la place pour la navigation et le panier.
+    local footerHeight = 8
+    local usableHeight =
+        height - firstY - footerHeight + 1
+
+    local perPage = math.max(
+        1,
+        math.floor(
+            (usableHeight + gap)
+                / (buttonHeight + gap)
+        )
+    )
+
+    local pageCount =
+        math.max(1, math.ceil(#items / perPage))
+
+    page = math.max(
+        1,
+        math.min(page or 1, pageCount)
+    )
+
+    local startIndex =
+        (page - 1) * perPage + 1
+
+    local endIndex =
+        math.min(
+            #items,
+            startIndex + perPage - 1
+        )
+
+    local y = firstY
+
+    for index = startIndex, endIndex do
+        local item = items[index]
+
+        gui.button(
+            "item",
+            2,
+            y,
+            width - 2,
+            buttonHeight,
+            labelFunction(item),
+            {
+                backgroundColor = gui.theme.surface,
+                data = item,
+                align = "left",
+                leftMarker = true,
+                markerColor = gui.theme.accent
+            }
+        )
+
+        y = y + buttonHeight + gap
+    end
+
+    local navigationY = height - 7
+    local sideWidth =
+        math.max(7, math.floor((width - 6) / 4))
+
+    gui.button(
+        "previous",
+        2,
+        navigationY,
+        sideWidth,
+        2,
+        "< PREV",
+        {
+            enabled = page > 1,
+            backgroundColor = gui.theme.primary
+        }
+    )
+
+    gui.drawPageIndicator(
+        page,
+        pageCount,
+        navigationY
+    )
+
+    gui.button(
+        "next",
+        width - sideWidth,
+        navigationY,
+        sideWidth,
+        2,
+        "SUIV >",
+        {
+            enabled = page < pageCount,
+            backgroundColor = gui.theme.primary
+        }
+    )
+
+    if showBack then
+        local backWidth =
+            math.max(9, math.floor(width / 3))
+
+        gui.button(
+            "back",
+            2,
+            height - 4,
+            backWidth,
+            3,
+            "RETOUR",
+            {
+                backgroundColor = colors.red
+            }
+        )
+    end
+
+    drawCartButton()
+
+    return page, pageCount
+end
+
+local function selectCategory()
+    local page = 1
+
+    while true do
+        page = drawPagedList(
+            "Categories",
+            "Choisissez une categorie",
+            state.categories,
+            function(category)
+                return category.name
+                    .. "  ["
+                    .. tostring(#category.recipes)
+                    .. "]"
+            end,
+            page,
+            false
+        )
+
+        local action, category = gui.waitTouch()
+
+        if action == "item" then
+            state.selectedCategory = category
+            return "category"
+        elseif action == "cart" then
+            return "cart"
+        elseif action == "previous" then
+            page = page - 1
+        elseif action == "next" then
+            page = page + 1
+        end
+    end
+end
+
+local function selectRecipe()
+    local page = 1
+
+    while true do
+        page = drawPagedList(
+            state.selectedCategory.name,
+            state.selectedCategory.name,
+            state.selectedCategory.recipes,
+            function(recipe)
+                return tostring(recipe.label or recipe.id)
+            end,
+            page,
+            true
+        )
+
+        local action, recipe = gui.waitTouch()
+
+        if action == "item" then
+            state.selectedRecipe = recipe
+            state.quantity = 1
+            return "recipe"
+        elseif action == "back" then
+            return "back"
+        elseif action == "cart" then
+            return "cart"
+        elseif action == "previous" then
+            page = page - 1
+        elseif action == "next" then
+            page = page + 1
+        end
+    end
+end
+
+------------------------------------------------------------
+-- Écran quantité
+------------------------------------------------------------
+
+local function drawQuantityScreen()
+    gui.clear(gui.theme.background)
+
+    local recipeLabel =
+        tostring(
+            state.selectedRecipe.label
+                or state.selectedRecipe.id
+        )
+
+    gui.topBar(
+        "CraftBot",
+        recipeLabel,
+        getKitchenStatusText(),
+        gui.theme.success
+    )
+
+    local width, height = gui.getSize()
+    local cardX = 3
+    local cardY = 5
+    local cardWidth = width - 4
+    local cardHeight =
+        math.max(8, math.min(11, height - 15))
+
+    gui.panel(
+        cardX,
+        cardY,
+        cardWidth,
+        cardHeight,
+        {
+            backgroundColor = gui.theme.surface
+        }
+    )
+
+    gui.centerText(
+        cardY + 1,
+        "QUANTITE",
+        gui.theme.muted,
+        gui.theme.surface,
+        cardX,
+        cardWidth
+    )
+
+    gui.centerText(
+        cardY + 4,
+        tostring(state.quantity),
+        gui.theme.warning,
+        gui.theme.surface,
+        cardX,
+        cardWidth
+    )
+
+    local controlY = cardY + cardHeight + 1
+    local smallWidth =
+        math.max(6, math.floor((width - 9) / 4))
+
+    gui.button(
+        "minus5",
+        2,
+        controlY,
+        smallWidth,
+        3,
+        "-5",
+        {
+            backgroundColor = colors.red
+        }
+    )
+
+    gui.button(
+        "minus1",
+        3 + smallWidth,
+        controlY,
+        smallWidth,
+        3,
+        "-1",
+        {
+            backgroundColor = colors.orange
+        }
+    )
+
+    gui.button(
+        "plus1",
+        4 + smallWidth * 2,
+        controlY,
+        smallWidth,
+        3,
+        "+1",
+        {
+            backgroundColor = colors.green
+        }
+    )
+
+    gui.button(
+        "plus5",
+        5 + smallWidth * 3,
+        controlY,
+        math.max(
+            1,
+            width - (5 + smallWidth * 3) + 1
+        ),
+        3,
+        "+5",
+        {
+            backgroundColor = colors.lime,
+            textColor = colors.black
+        }
+    )
+
+    gui.button(
+        "add",
+        3,
+        height - 10,
+        width - 4,
+        3,
+        "AJOUTER AU PANIER",
+        {
+            backgroundColor = gui.theme.primaryDark,
+            textColor = colors.black
+        }
+    )
+
+    local backWidth =
+        math.max(9, math.floor(width / 3))
+
+    gui.button(
+        "back",
+        2,
+        height - 4,
+        backWidth,
+        3,
+        "RETOUR",
+        {
+            backgroundColor = gui.theme.surfaceAlt,
+            textColor = colors.black
+        }
+    )
+
+    drawCartButton()
+end
+
+local function selectQuantity()
+    while true do
+        drawQuantityScreen()
+
+        local action = gui.waitTouch()
+
+        if action == "minus5" then
+            state.quantity =
+                math.max(1, state.quantity - 5)
+        elseif action == "minus1" then
+            state.quantity =
+                math.max(1, state.quantity - 1)
+        elseif action == "plus1" then
+            state.quantity = state.quantity + 1
+        elseif action == "plus5" then
+            state.quantity = state.quantity + 5
+        elseif action == "add" then
+            addToCart(
+                state.selectedRecipe,
+                state.quantity
+            )
+
+            return "added"
+        elseif action == "cart" then
+            return "cart"
+        elseif action == "back" then
+            return "back"
+        end
+    end
+end
+
+------------------------------------------------------------
+-- Écran panier
+------------------------------------------------------------
+
+local function drawCartScreen(page)
+    gui.clear(gui.theme.background)
+
+    local articleCount = getCartArticleCount()
+    local lineCount = getCartLineCount()
+
+    gui.topBar(
+        "CraftBot",
+        "Votre commande",
+        tostring(articleCount) .. " ARTICLE(S)",
+        gui.theme.accent
+    )
+
+    local width, height = gui.getSize()
+    local firstY = 5
+    local rowHeight = 3
+    local gap = 1
+    local footerHeight = 9
+    local usableHeight =
+        height - firstY - footerHeight + 1
+
+    local perPage =
+        math.max(
+            1,
+            math.floor(
+                (usableHeight + gap)
+                    / (rowHeight + gap)
+            )
+        )
+
+    local pageCount =
+        math.max(1, math.ceil(lineCount / perPage))
+
+    page = math.max(
+        1,
+        math.min(page or 1, pageCount)
+    )
+
+    if lineCount == 0 then
+        local panelWidth = width - 6
+        local panelX = 4
+
+        gui.panel(
+            panelX,
+            7,
+            panelWidth,
+            7,
+            {
+                backgroundColor = gui.theme.surface
+            }
+        )
+
+        gui.centerText(
+            10,
+            "Votre panier est vide",
+            gui.theme.muted,
+            gui.theme.surface,
+            panelX,
+            panelWidth
+        )
+    else
+        local startIndex =
+            (page - 1) * perPage + 1
+
+        local endIndex =
+            math.min(
+                lineCount,
+                startIndex + perPage - 1
+            )
+
+        local y = firstY
+
+        for index = startIndex, endIndex do
+            local item = state.cart[index]
+            local removeWidth = 5
+            local rowWidth = width - 8
+            local label =
+                tostring(
+                    item.recipe.label
+                        or item.recipe.id
+                )
+                .. "  x"
+                .. tostring(item.quantity)
+
+            gui.button(
+                "cart_item",
+                2,
+                y,
+                rowWidth,
+                rowHeight,
+                label,
+                {
+                    backgroundColor = gui.theme.surface,
+                    data = item,
+                    align = "left",
+                    leftMarker = true,
+                    markerColor = gui.theme.primaryDark
+                }
+            )
+
+            gui.button(
+                "remove",
+                width - removeWidth,
+                y,
+                removeWidth,
+                rowHeight,
+                "X",
+                {
+                    backgroundColor = gui.theme.danger,
+                    data = item
+                }
+            )
+
+            y = y + rowHeight + gap
+        end
+    end
+
+    local navigationY = height - 8
+    local sideWidth =
+        math.max(7, math.floor((width - 6) / 4))
+
+    gui.button(
+        "previous",
+        2,
+        navigationY,
+        sideWidth,
+        2,
+        "< PREV",
+        {
+            enabled = page > 1,
+            backgroundColor = gui.theme.primary
+        }
+    )
+
+    gui.drawPageIndicator(
+        page,
+        pageCount,
+        navigationY
+    )
+
+    gui.button(
+        "next",
+        width - sideWidth,
+        navigationY,
+        sideWidth,
+        2,
+        "SUIV >",
+        {
+            enabled = page < pageCount,
+            backgroundColor = gui.theme.primary
+        }
+    )
+
+    local backWidth =
+        math.max(9, math.floor((width - 5) / 3))
+
+    local orderX = backWidth + 3
+    local orderWidth = width - orderX - 1
+
+    gui.button(
+        "back",
+        2,
+        height - 4,
+        backWidth,
+        3,
+        "AJOUTER",
+        {
+            backgroundColor = gui.theme.surfaceAlt,
+            textColor = colors.black
+        }
+    )
+
+    gui.button(
+        "order",
+        orderX,
+        height - 4,
+        orderWidth,
+        3,
+        "VALIDER LA COMMANDE",
+        {
+            enabled = lineCount > 0,
+            backgroundColor = gui.theme.success,
+            textColor = colors.black
+        }
+    )
+
+    return page
+end
+
+local function openCart()
+    local page = 1
+
+    while true do
+        page = drawCartScreen(page)
+
+        local action, item = gui.waitTouch()
+
+        if action == "remove" then
+            removeFromCart(item)
+
+            local lineCount = getCartLineCount()
+
+            if lineCount == 0 then
+                page = 1
+            end
+        elseif action == "previous" then
+            page = page - 1
+        elseif action == "next" then
+            page = page + 1
+        elseif action == "back" then
+            return "back"
+        elseif action == "order" then
+            return "order"
+        end
+    end
+end
+
+local function generateOrderNumber()
+    local computerId = os.getComputerID()
+    local suffix
+
+    local ok, epoch = pcall(function()
+        return os.epoch("utc")
+    end)
+
+    if ok and epoch then
+        suffix = tostring(epoch):sub(-6)
+    else
+        suffix =
+            tostring(os.day())
+            .. string.format("%04d", math.floor(os.time() * 100))
+    end
+
+    return "CB-" .. tostring(computerId) .. "-" .. suffix
+end
+
+
+------------------------------------------------------------
+-- Impression du ticket
+------------------------------------------------------------
+
+local function findPrinter()
+    return peripheral.find("printer")
+end
+
+local function getRecipeLabel(recipe)
+    return tostring(recipe.label or recipe.id or "Article")
+end
+
+local function printOrderTicket(orderNumber)
+    local printer = findPrinter()
+
+    if not printer then
+        return false, "Aucune imprimante detectee"
+    end
+
+    if printer.getPaperLevel and printer.getPaperLevel() <= 0 then
+        return false, "L'imprimante n'a plus de papier"
+    end
+
+    if printer.getInkLevel and printer.getInkLevel() <= 0 then
+        return false, "L'imprimante n'a plus d'encre"
+    end
+
+    if not printer.newPage() then
+        return false, "Impossible de preparer une nouvelle page"
+    end
+
+    printer.setPageTitle("Ticket " .. orderNumber)
+    printer.setCursorPos(1, 1)
+    printer.write("CRAFTBOT RESTAURANT")
+    printer.setCursorPos(1, 2)
+    printer.write("Commande " .. orderNumber)
+    printer.setCursorPos(1, 3)
+    printer.write(string.rep("-", 20))
+
+    local line = 4
+    local totalArticles = 0
+
+    for _, item in ipairs(state.cart) do
+        local quantity = tonumber(item.quantity) or 0
+        totalArticles = totalArticles + quantity
+
+        local text = tostring(quantity) .. " x " .. getRecipeLabel(item.recipe)
+
+        while #text > 25 do
+            printer.setCursorPos(1, line)
+            printer.write(text:sub(1, 25))
+            text = text:sub(26)
+            line = line + 1
+        end
+
+        printer.setCursorPos(1, line)
+        printer.write(text)
+        line = line + 1
+    end
+
+    line = line + 1
+    printer.setCursorPos(1, line)
+    printer.write(string.rep("-", 20))
+    printer.setCursorPos(1, line + 1)
+    printer.write("Total : " .. tostring(totalArticles) .. " article(s)")
+    printer.setCursorPos(1, line + 3)
+    printer.write("Merci et bon appetit !")
+
+    if not printer.endPage() then
+        return false, "L'impression du ticket a echoue"
+    end
+
+    return true
+end
+
+local function askForTicket(orderNumber)
+    local printerAvailable = findPrinter() ~= nil
+
+    if not printerAvailable then
+        gui.messageBox(
+            "Ticket indisponible",
+            "Aucune imprimante n'est detectee. La commande va continuer sans ticket.",
+            false,
+            "CONTINUER"
+        )
+        gui.waitTouch()
+        return true
+    end
+
+    gui.confirmBox(
+        "Ticket de commande",
+        "Voulez-vous imprimer un ticket pour la commande " .. orderNumber .. " ?",
+        "OUI",
+        "NON",
+        true
+    )
+
+    local action = gui.waitTouch()
+
+    if action ~= "yes" then
+        return true
+    end
+
+    local printed, printError = printOrderTicket(orderNumber)
+
+    if not printed then
+        gui.messageBox(
+            "Impression impossible",
+            tostring(printError) .. ". La commande peut tout de meme continuer.",
+            false,
+            "CONTINUER"
+        )
+        gui.waitTouch()
+    end
+
+    return true
+end
+
+------------------------------------------------------------
+-- Fabrication parallèle de la commande
+------------------------------------------------------------
+
+local function finalCraftTasks(tasks)
+    local grouped = {}
+    local ordered = {}
+    local intermediateStarted = false
+    local intermediateFailed = false
+
+    -- Les sous-crafts restent masqués, mais leur état influence
+    -- désormais l'état graphique du produit final.
+    for _, task in ipairs(tasks or {}) do
+        local phase = tonumber(task.phase) or 0
+
+        if phase > 0 then
+            if task.status == "running"
+                or task.status == "ready" then
+                intermediateStarted = true
+            elseif task.status == "failed" then
+                intermediateFailed = true
+            end
+        end
+    end
+
+    for _, task in ipairs(tasks or {}) do
+        if (tonumber(task.phase) or 0) == 0 then
+            local recipe = task.recipe or {}
+            local recipeKey =
+                tostring(
+                    recipe.id
+                    or recipe.module
+                    or recipe.label
+                    or "inconnu"
+                )
+
+            local group = grouped[recipeKey]
+
+            if not group then
+                group = {
+                    id = "display-" .. recipeKey,
+                    lineIndex = recipeKey,
+                    recipe = recipe,
+                    quantity = 0,
+                    current = 0,
+                    total = 0,
+                    status = "waiting",
+                    phase = 0,
+                    hasWaiting = false,
+                    hasRunning = false,
+                    hasReady = false,
+                    hasFailed = false
+                }
+
+                grouped[recipeKey] = group
+                table.insert(ordered, group)
+            end
+
+            local quantity =
+                math.max(0, tonumber(task.quantity) or 0)
+            local current =
+                math.max(0, tonumber(task.current) or 0)
+            local total =
+                math.max(1, tonumber(task.total) or quantity or 1)
+
+            group.quantity = group.quantity + quantity
+            group.total = group.total + quantity
+
+            if task.status == "ready" then
+                group.current = group.current + quantity
+                group.hasReady = true
+            elseif task.status == "running" then
+                local ratio =
+                    math.max(
+                        0,
+                        math.min(1, current / total)
+                    )
+
+                group.current =
+                    group.current + quantity * ratio
+                group.hasRunning = true
+            elseif task.status == "failed" then
+                group.hasFailed = true
+            else
+                group.hasWaiting = true
+            end
+        end
+    end
+
+    for _, group in ipairs(ordered) do
+        if group.hasFailed or intermediateFailed then
+            group.status = "failed"
+        elseif group.hasReady
+            and not group.hasRunning
+            and not group.hasWaiting then
+            group.status = "ready"
+            group.current = group.quantity
+        elseif group.hasRunning
+            or group.hasReady
+            or intermediateStarted then
+            -- Même si la tâche finale n'a pas encore commencé,
+            -- le produit est déjà en préparation dès qu'un ingrédient
+            -- intermédiaire est en cours ou prêt.
+            group.status = "running"
+        else
+            group.status = "waiting"
+        end
+
+        group.current =
+            math.max(
+                0,
+                math.min(group.current, group.quantity)
+            )
+
+        group.hasWaiting = nil
+        group.hasRunning = nil
+        group.hasReady = nil
+        group.hasFailed = nil
+    end
+
+    return ordered
+end
+
+local function runOrder()
+    if #state.cart == 0 then
+        return false
+    end
+
+    gui.status(
+        "Commande",
+        "Envoi au serveur...",
+        colors.yellow,
+        state.serverName or "Serveur"
+    )
+
+    local sent, sendError = network.send(
+        state.serverId,
+        protocol.makeMessage(
+            protocol.TYPE.ORDER_CREATE,
+            {
+                items = state.cart
+            }
+        )
+    )
+
+    if not sent then
+        gui.messageBox(
+            "Commande impossible",
+            tostring(sendError),
+            false,
+            "MENU"
+        )
+        gui.waitTouch()
+        return false
+    end
+
+    local _, accepted, acceptError = waitForMessage(
+        8,
+        function(senderId, message)
+            return senderId == state.serverId
+                and (
+                    message.type == protocol.TYPE.ORDER_ACCEPTED
+                    or message.type == protocol.TYPE.ORDER_FAILED
+                )
+        end
+    )
+
+    if not accepted then
+        gui.messageBox(
+            "Commande impossible",
+            tostring(acceptError),
+            false,
+            "MENU"
+        )
+        gui.waitTouch()
+        return false
+    end
+
+    local acceptedData = accepted.data or accepted
+
+    if accepted.type == protocol.TYPE.ORDER_FAILED then
+        gui.messageBox(
+            "Commande refusee",
+            acceptedData.message or "Erreur serveur",
+            false,
+            "MENU"
+        )
+        gui.waitTouch()
+        return false
+    end
+
+    local orderId = acceptedData.orderId
+    local orderNumber =
+        acceptedData.orderNumber
+        or ("#" .. tostring(orderId))
+
+    -- Le ticket reste proposé sur la Borne.
+    askForTicket(orderNumber)
+
+    -- La progression est désormais entièrement déportée sur le Moniteur.
+    -- La Borne est immédiatement libérée pour le client suivant.
+    state.cart = {}
+
+    gui.messageBox(
+        "Commande validee",
+        "Commande "
+            .. tostring(orderNumber)
+            .. " transmise en cuisine.",
+        true,
+        "Retour au menu"
+    )
+
+    sleep(1.2)
+    return true
+end
+
+local function heartbeatLoop()
+    local consecutiveFailures = 0
+
+    while true do
+        sleep(3)
+
+        if state.registered and state.serverId then
+            local callWorked, sent = pcall(
+                network.send,
+                state.serverId,
+                protocol.makeMessage(
+                    protocol.TYPE.HEARTBEAT,
+                    {
+                        role = protocol.ROLE.TERMINAL,
+                        status = "disponible"
+                    }
+                )
+            )
+
+            if callWorked and sent then
+                consecutiveFailures = 0
+            else
+                consecutiveFailures = consecutiveFailures + 1
+            end
+
+            if consecutiveFailures >= 3 then
+                state.registered = false
+                state.serverId = nil
+                state.serverName = nil
+                consecutiveFailures = 0
+            end
+        else
+            -- La Borne se réinscrit sans obliger l'utilisateur à la
+            -- redémarrer ni à perdre son panier.
+            local callWorked, connected =
+                pcall(discoverServer)
+
+            if not callWorked or not connected then
+                state.registered = false
+                sleep(2)
+            end
+        end
+    end
+end
+
+local function browseRecipes()
+    while true do
+        local categoryAction = selectCategory()
+
+        if categoryAction == "cart" then
+            local cartAction = openCart()
+
+            if cartAction == "order" then
+                runOrder()
+            end
+        elseif categoryAction == "category" then
+            local stayInCategory = true
+
+            while stayInCategory do
+                local recipeAction = selectRecipe()
+
+                if recipeAction == "back" then
+                    stayInCategory = false
+                elseif recipeAction == "cart" then
+                    local cartAction = openCart()
+
+                    if cartAction == "order" then
+                        runOrder()
+                        stayInCategory = false
+                    end
+                elseif recipeAction == "recipe" then
+                    local quantityAction =
+                        selectQuantity()
+
+                    if quantityAction == "cart" then
+                        local cartAction = openCart()
+
+                        if cartAction == "order" then
+                            runOrder()
+                            stayInCategory = false
+                        end
+                    end
+
+                    -- "added" et "back" renvoient simplement
+                    -- à la liste des recettes de la catégorie.
+                end
+            end
+        end
+    end
+end
+
+------------------------------------------------------------
+-- Démarrage
+------------------------------------------------------------
+
+local function main()
+    local initialized, initError = gui.init(0.5)
+
+    if not initialized then
+        logger.error(initError)
+        return
+    end
+
+    local opened, openResult = network.open()
+
+    if not opened then
+        gui.status(
+            "Erreur",
+            tostring(openResult),
+            colors.red
+        )
+
+        logger.error(openResult)
+        return
+    end
+
+    local discovered, discoveryError =
+        discoverServer()
+
+    if not discovered then
+        gui.messageBox(
+            "Connexion impossible",
+            discoveryError,
+            false,
+            "FERMER"
+        )
+
+        logger.error(discoveryError)
+        return
+    end
+
+    local loaded, recipesError =
+        requestRecipes()
+
+    if not loaded then
+        gui.messageBox(
+            "Recettes indisponibles",
+            tostring(recipesError),
+            false,
+            "FERMER"
+        )
+
+        logger.error(recipesError)
+        return
+    end
+
+    buildCategories()
+
+    if #state.categories == 0 then
+        gui.messageBox(
+            "Aucune recette",
+            "Aucune recette visible n'a ete recue.",
+            false,
+            "FERMER"
+        )
+
+        return
+    end
+
+    parallel.waitForAny(
+        browseRecipes,
+        heartbeatLoop
+    )
+end
+
+local ok, errorMessage = pcall(main)
+
+if not ok then
+    logger.error(errorMessage)
+
+    local displayed = pcall(function()
+        gui.messageBox(
+            "Erreur critique",
+            tostring(errorMessage),
+            false,
+            "FERMER"
+        )
+    end)
+
+    if not displayed then
+        printError(errorMessage)
+    end
+end

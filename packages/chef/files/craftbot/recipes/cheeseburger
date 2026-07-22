@@ -1,0 +1,24 @@
+local items = require("items")
+ 
+return {
+    id = "chesseburger",
+    label = "chesseburger",
+ 
+    visible = true,
+    category = "burger",
+
+    output = items.cheeseburger,
+    outputCount = 1,
+ 
+    ingredients = {
+        [1] = items.skillet,
+        [2] = items.pain,
+        [3] = items.groundbeef,
+        [5] = items.silkentofu,
+        [6] = items.saucesoja,
+    },
+
+	returns = {
+        items.skillet
+    }
+}
