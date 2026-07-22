@@ -1,52 +1,131 @@
-# CraftBot
+# 🍔 CraftBot Manager
 
-CraftBot est un système de restaurant automatisé pour **Minecraft**, développé avec
-**CC:Tweaked**, **Applied Energistics 2** et **Advanced Peripherals**.
+CraftBot est un système complet de gestion de restaurant pour **Minecraft** utilisant **CC:Tweaked** et **Applied Energistics 2**.
 
-Ce dépôt contient :
+Le projet permet de gérer automatiquement des bornes de commande, des chefs, un serveur central et un moniteur de cuisine.
 
-- le **CraftBot Manager** ;
-- le paquet **Serveur** ;
-- le paquet **Chef** ;
-- le paquet **Borne** ;
-- le paquet **Moniteur** ;
-- les scripts d'installation et de mise à jour depuis GitHub.
+---
 
-## Installation dans ComputerCraft
+# ✨ Fonctionnalités
 
-Après avoir publié ce dossier dans un dépôt GitHub public, exécutez dans ComputerCraft :
+- 📦 Gestionnaire de paquets intégré
+- 🔄 Installation et mises à jour automatiques
+- ✅ Vérification de l'intégrité des fichiers
+- 🔧 Réparation automatique des installations
+- 💾 Sauvegarde avant chaque mise à jour
+- 📜 Consultation des changelogs
+- 🌐 Téléchargement des packages depuis GitHub
 
-```text
-wget run https://raw.githubusercontent.com/BemJ77/CraftBot/main/install.lua BemJ77 CraftBot main
+---
+
+# 📋 Prérequis
+
+- Minecraft
+- CC:Tweaked
+- Connexion HTTP activée
+- Accès à Internet
+
+---
+
+# 🚀 Installation
+
+Sur un ordinateur ComputerCraft neuf, exécutez simplement :
+
+```lua
+pastebin run T9FdVU8t
 ```
 
-L'API HTTP doit être activée dans la configuration du serveur Minecraft.
+L'installateur va automatiquement :
 
-## Mise à jour
+1. Télécharger le dernier installateur depuis GitHub
+2. Installer CraftBot Manager
+3. Télécharger les fichiers nécessaires
+4. Configurer le système
+5. Proposer un redémarrage
 
-Les nouvelles versions des paquets sont recherchées automatiquement au lancement du
-Manager.
+Aucune autre manipulation n'est nécessaire.
 
-Pour mettre à jour uniquement le Manager :
+---
 
-```text
-update-manager
+# 📦 Mise à jour
+
+Les mises à jour sont gérées directement depuis le CraftBot Manager.
+
+Il suffit de choisir :
+
+```
+Packages
+→ Mise à jour
 ```
 
-## Organisation
+Le Manager téléchargera automatiquement les nouvelles versions disponibles.
 
-```text
-config/             Configuration du Manager et du dépôt GitHub
-core/               Modules du Manager
-ui/                 Interface
-packages/           Paquets CraftBot
-catalog.lua         Catalogue distant des paquets
-manifest.lua        Liste des fichiers téléchargeables
-install.lua         Installation initiale depuis GitHub
-update-manager.lua  Mise à jour du Manager
+---
+
+# 🖥️ Packages disponibles
+
+- 🧑‍🍳 Chef
+- 🖥️ Serveur
+- 🛒 Borne de commande
+- 📺 Moniteur de cuisine
+
+Chaque package peut être :
+
+- installé
+- vérifié
+- mis à jour
+- désinstallé
+
+indépendamment.
+
+---
+
+# 📂 Structure du dépôt
+
+```
+config/
+core/
+packages/
+ui/
+
+catalog.lua
+install.lua
+manager.lua
+manifest.lua
+startup
+README.md
 ```
 
-## Versions incluses
+---
 
-- CraftBot Manager : **1.4.0**
-- Paquets CraftBot : versions indiquées dans chaque `package.lua`
+# 🔨 Développement
+
+Le projet est développé en Lua pour CC:Tweaked.
+
+Les packages sont automatiquement détectés depuis le dossier :
+
+```
+packages/
+```
+
+Chaque package possède son propre :
+
+- package.lua
+- changelog.lua
+- fichiers
+
+Le Manager construit automatiquement les informations nécessaires.
+
+---
+
+# 🌐 Dépôt GitHub
+
+https://github.com/BemJ77/CraftBot
+
+---
+
+# 📄 Licence
+
+Aucune licence n'est définie pour le moment.
+
+Tous droits réservés © BemJ77.
