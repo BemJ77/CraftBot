@@ -17,10 +17,8 @@ Ce dépôt contient :
 Après avoir publié ce dossier dans un dépôt GitHub public, exécutez dans ComputerCraft :
 
 ```text
-wget run https://raw.githubusercontent.com/UTILISATEUR/CraftBot/main/install.lua UTILISATEUR CraftBot main
+wget run https://raw.githubusercontent.com/BemJ77/CraftBot/main/install.lua BemJ77 CraftBot main
 ```
-
-Remplacez `UTILISATEUR` par votre nom d'utilisateur GitHub.
 
 L'API HTTP doit être activée dans la configuration du serveur Minecraft.
 
