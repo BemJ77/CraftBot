@@ -1,212 +1,142 @@
 local remote = {}
-
 local logger = require("core.logger")
-local version = require("core.version")
-
-local CONFIG_PATH = "/config/repository.lua"
-local CATALOG_PATH = "/downloads/catalog.lua"
+local CONFIG = "/config/repository.lua"
+local CATALOG = "/downloads/catalog.lua"
 
 local function loadTable(path)
-    if not fs.exists(path) or fs.isDir(path) then
-        return nil, "Fichier absent : " .. path
-    end
-
-    local fn, err = loadfile(path)
-    if not fn then return nil, err end
-
-    local ok, value = pcall(fn)
+    if not fs.exists(path) or fs.isDir(path) then return nil, "Fichier absent : " .. path end
+    local chunk, err = loadfile(path)
+    if not chunk then return nil, err end
+    local ok, value = pcall(chunk)
     if not ok then return nil, value end
-    if type(value) ~= "table" then
-        return nil, "Table Lua attendue : " .. path
-    end
-
+    if type(value) ~= "table" then return nil, "Table Lua attendue : " .. path end
     return value
 end
 
-local function config()
-    local value, err = loadTable(CONFIG_PATH)
-    if not value then return nil, err end
-
-    if value.enabled ~= true then
-        return nil, "Depot GitHub non configure"
-    end
-
-    if not value.owner or value.owner == ""
-        or value.owner == "VOTRE_UTILISATEUR" then
-        return nil, "Proprietaire GitHub non configure"
-    end
-
-    if not value.repository or value.repository == "" then
-        return nil, "Nom du depot GitHub non configure"
-    end
-
-    return value
+local function repository()
+    local cfg, err = loadTable(CONFIG)
+    if not cfg then return nil, err end
+    if cfg.enabled ~= true then return nil, "Depot GitHub non configure" end
+    return cfg
 end
 
-local function rawBase(cfg)
-    return "https://raw.githubusercontent.com/"
-        .. cfg.owner .. "/"
-        .. cfg.repository .. "/"
-        .. (cfg.branch or "main")
+local function baseUrl(cfg)
+    return "https://raw.githubusercontent.com/" .. cfg.owner .. "/"
+        .. cfg.repository .. "/" .. (cfg.branch or "main")
 end
 
 local function ensureParent(path)
-    local parent = fs.getDir(path)
-    if parent ~= "" and not fs.exists(parent) then
-        fs.makeDir(parent)
-    end
+    local dir = fs.getDir(path)
+    if dir ~= "" and not fs.exists(dir) then fs.makeDir(dir) end
 end
 
 local function download(url, destination)
-    if not http or not http.get then
-        return false, "API HTTP indisponible"
-    end
-
+    if not http or not http.get then return false, "API HTTP indisponible" end
     local response, err = http.get(url, nil, true)
-    if not response then
-        return false, tostring(err or "Telechargement impossible")
-    end
-
+    if not response then return false, tostring(err or "Telechargement impossible") end
     local data = response.readAll()
     response.close()
-
-    if data == nil then
-        return false, "Reponse vide"
-    end
+    if type(data) ~= "string" or data == "" then return false, "Reponse vide" end
 
     ensureParent(destination)
-
-    local temp = destination .. ".download"
-    if fs.exists(temp) then fs.delete(temp) end
-
-    local handle = fs.open(temp, "wb")
-    if not handle then
-        return false, "Impossible d'ecrire " .. temp
-    end
-
-    handle.write(data)
-    handle.close()
-
     if fs.exists(destination) then fs.delete(destination) end
-    fs.move(temp, destination)
-
+    local file = fs.open(destination, "w")
+    if not file then return false, "Impossible d'ecrire " .. destination end
+    local ok, writeErr = pcall(function() file.write(data) end)
+    file.close()
+    if not ok then
+        if fs.exists(destination) then fs.delete(destination) end
+        return false, tostring(writeErr)
+    end
     return true
 end
 
-local function localPackageVersion(folder)
-    local metadata = "/packages/" .. folder .. "/package.lua"
-    local value = loadTable(metadata)
-    if not value then return nil end
-    return value.version
+local function getCatalog()
+    local cfg, err = repository()
+    if not cfg then return nil, nil, err end
+    if not fs.exists("/downloads") then fs.makeDir("/downloads") end
+    local base = baseUrl(cfg)
+    local ok, downloadErr = download(base .. "/catalog.lua", CATALOG)
+    if not ok then return nil, nil, downloadErr end
+    local catalog, catalogErr = loadTable(CATALOG)
+    if not catalog then return nil, nil, catalogErr end
+    return catalog, base
 end
 
-local function downloadPackage(base, entry, onProgress, offset, total)
-    local staging = "/downloads/packages/" .. entry.folder
+local function findEntry(catalog, folder)
+    for _, entry in ipairs(catalog.packages or {}) do
+        if entry.folder == folder then return entry end
+    end
+end
 
-    if fs.exists(staging) then fs.delete(staging) end
-    fs.makeDir(staging)
+function remote.syncIndex(onProgress)
+    local result = { success = false, updated = 0, errors = {} }
+    local catalog, base, err = getCatalog()
+    if not catalog then result.errors[1] = err; return result end
+
+    if not fs.exists("/packages") then fs.makeDir("/packages") end
+    local entries = catalog.packages or {}
+    local total, current = #entries * 2, 0
+
+    for _, entry in ipairs(entries) do
+        local root = "/packages/" .. entry.folder
+        if not fs.exists(root) then fs.makeDir(root) end
+        if not fs.exists(root .. "/files") then fs.makeDir(root .. "/files") end
+
+        for _, name in ipairs({ "package.lua", "changelog.lua" }) do
+            if onProgress then onProgress(current, total, entry.folder .. "/" .. name, "Index GitHub") end
+            local ok, downloadErr = download(
+                base .. "/packages/" .. entry.folder .. "/" .. name,
+                root .. "/" .. name
+            )
+            if not ok then
+                result.errors[#result.errors + 1] =
+                    entry.folder .. "/" .. name .. " : " .. tostring(downloadErr)
+            end
+            current = current + 1
+        end
+        result.updated = result.updated + 1
+    end
+
+    if onProgress then onProgress(total, total, "Index actualise", "Termine") end
+    result.success = #result.errors == 0
+    return result
+end
+
+function remote.downloadPackage(folder, onProgress)
+    local result = { success = false, downloaded = 0, total = 0, errors = {} }
+    local catalog, base, err = getCatalog()
+    if not catalog then result.errors[1] = err; return result end
+
+    local entry = findEntry(catalog, folder)
+    if not entry then
+        result.errors[1] = "Paquet absent du catalogue : " .. tostring(folder)
+        return result
+    end
+
+    result.total = #(entry.files or {})
+    local root = "/packages/" .. folder
+    if fs.exists(root) then fs.delete(root) end
+    fs.makeDir(root)
 
     for index, relative in ipairs(entry.files or {}) do
         if onProgress then
-            onProgress(
-                offset + index - 1,
-                total,
-                entry.folder .. "/" .. relative,
-                "Telechargement"
-            )
+            onProgress(index - 1, result.total, folder .. "/" .. relative, "Telechargement")
         end
-
-        local destination = fs.combine(staging, relative)
-        local url = base
-            .. "/packages/"
-            .. entry.folder
-            .. "/"
-            .. relative
-
-        local ok, err = download(url, destination)
+        local ok, downloadErr = download(
+            base .. "/packages/" .. folder .. "/" .. relative,
+            root .. "/" .. relative
+        )
         if not ok then
-            return false,
-                entry.folder .. "/" .. relative .. " : " .. tostring(err)
+            result.errors[1] = folder .. "/" .. relative .. " : " .. tostring(downloadErr)
+            logger.error(result.errors[1])
+            return result
         end
+        result.downloaded = result.downloaded + 1
     end
 
-    local final = "/packages/" .. entry.folder
-    local old = final .. ".old"
-
-    if fs.exists(old) then fs.delete(old) end
-    if fs.exists(final) then fs.move(final, old) end
-
-    local moved, moveError = pcall(fs.move, staging, final)
-    if not moved then
-        if fs.exists(old) and not fs.exists(final) then
-            fs.move(old, final)
-        end
-        return false, tostring(moveError)
-    end
-
-    if fs.exists(old) then fs.delete(old) end
-    return true
-end
-
-function remote.syncPackages(onProgress)
-    local result = {
-        success = false,
-        updated = 0,
-        errors = {}
-    }
-
-    local cfg, cfgError = config()
-    if not cfg then
-        result.errors[1] = cfgError
-        return result
-    end
-
-    if not fs.exists("/downloads") then fs.makeDir("/downloads") end
-
-    local base = rawBase(cfg)
-    local ok, err = download(base .. "/catalog.lua", CATALOG_PATH)
-    if not ok then
-        result.errors[1] = "Catalogue GitHub : " .. tostring(err)
-        return result
-    end
-
-    local catalog, catalogError = loadTable(CATALOG_PATH)
-    if not catalog then
-        result.errors[1] = "Catalogue invalide : " .. tostring(catalogError)
-        return result
-    end
-
-    local pending = {}
-    local totalFiles = 0
-
-    for _, entry in ipairs(catalog.packages or {}) do
-        local current = localPackageVersion(entry.folder)
-        if not current or version.compare(entry.version, current) > 0 then
-            pending[#pending + 1] = entry
-            totalFiles = totalFiles + #(entry.files or {})
-        end
-    end
-
-    local offset = 0
-    for _, entry in ipairs(pending) do
-        local downloaded, downloadError =
-            downloadPackage(base, entry, onProgress, offset, totalFiles)
-
-        if downloaded then
-            result.updated = result.updated + 1
-        else
-            result.errors[#result.errors + 1] = downloadError
-            logger.error("GitHub : " .. tostring(downloadError))
-        end
-
-        offset = offset + #(entry.files or {})
-    end
-
-    if onProgress and totalFiles > 0 then
-        onProgress(totalFiles, totalFiles, "Synchronisation terminee", "Termine")
-    end
-
-    result.success = #result.errors == 0
+    if onProgress then onProgress(result.total, result.total, "Paquet telecharge", "Termine") end
+    result.success = true
     return result
 end
 

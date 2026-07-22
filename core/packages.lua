@@ -65,7 +65,8 @@ function packages.discover()
                     for _, file in ipairs(rawFiles) do totalSize = totalSize + file.size end
 
                     found[#found + 1] = {
-                        id = metadata.id or folderName,
+                        folder = folderName,
+                    id = metadata.id or folderName,
                         name = metadata.name or folderName,
                         version = metadata.version or "0.0.0",
                         author = metadata.author or "Inconnu",
