@@ -38,6 +38,33 @@ local function askReboot(packageName)
     end
 end
 
+
+local function refreshPackage(folder)
+    local packages = packageManager.discover()
+    for _, package in ipairs(packages) do
+        if package.folder == folder then return package end
+    end
+end
+
+local function downloadFullPackage(package)
+    local result = remote.downloadPackage(package.folder, function(current, total, file, status)
+        progress.draw(
+            "TELECHARGEMENT " .. string.upper(package.name),
+            current, total, file, status
+        )
+    end)
+
+    if not result.success then
+        menu.message({
+            title = "TELECHARGEMENT IMPOSSIBLE",
+            lines = { result.errors[1] or "Erreur inconnue" }
+        })
+        return nil
+    end
+
+    return refreshPackage(package.folder)
+end
+
 local function installPackage(package)
     local allowed, err = installer.canInstall(package)
     if not allowed then
@@ -255,16 +282,16 @@ end
 local function main()
     logger.info("Demarrage CraftBot Manager " .. MANAGER_VERSION)
 
-    local syncResult = remote.syncPackages(function(current, total, file, status)
+    local syncResult = remote.syncIndex(function(current, total, file, status)
         progress.draw("SYNCHRONISATION GITHUB", current, total, file, status)
     end)
 
     if syncResult and syncResult.updated > 0 then
         sleep(0.4)
         menu.message({
-            title = "PAQUETS ACTUALISES",
+            title = "CATALOGUE ACTUALISE",
             lines = {
-                tostring(syncResult.updated) .. " paquet(s) telecharge(s)",
+                tostring(syncResult.updated) .. " paquet(s) disponible(s)",
                 "",
                 "Les nouvelles versions sont disponibles."
             }
