@@ -67,31 +67,67 @@ end
 
 local function installPackage(package)
     local allowed, err = installer.canInstall(package)
+
     if not allowed then
-        menu.message({ title = "INSTALLATION IMPOSSIBLE", lines = { err } })
+        menu.message({
+            title = "INSTALLATION IMPOSSIBLE",
+            lines = { err }
+        })
         return
     end
 
-    local compatible, compatibilityError = installer.checkCompatibility(package, MANAGER_VERSION)
+    local compatible, compatibilityError =
+        installer.checkCompatibility(package, MANAGER_VERSION)
+
     if not compatible then
-        menu.message({ title = "INCOMPATIBLE", lines = { compatibilityError } })
+        menu.message({
+            title = "INCOMPATIBLE",
+            lines = { compatibilityError }
+        })
         return
     end
 
     if not menu.confirm({
         title = "CONFIRMER L'INSTALLATION",
-        subtitle = package.name .. "  v" .. package.version,
+        subtitle = package.name .. " v" .. package.version,
         yesText = "Oui",
         noText = "Non"
-    }) then return end
+    }) then
+        return
+    end
 
-    local result = installer.install(package, MANAGER_VERSION, function(current, total, file, status)
-        progress.draw("INSTALLATION " .. string.upper(package.name), current, total, file, status)
-    end)
+    package = downloadFullPackage(package)
+    if not package then
+        return
+    end
+
+    local result = installer.install(
+        package,
+        MANAGER_VERSION,
+        function(current, total, file, status)
+            progress.draw(
+                "INSTALLATION " .. string.upper(package.name),
+                current,
+                total,
+                file,
+                status
+            )
+        end
+    )
 
     sleep(0.4)
-    showResult("INSTALLATION", result.success, result.copied, result.total, result.errors)
-    if result.success then askReboot(package.name) end
+
+    showResult(
+        "INSTALLATION",
+        result.success,
+        result.copied,
+        result.total,
+        result.errors
+    )
+
+    if result.success then
+        askReboot(package.name)
+    end
 end
 
 local function repairPackage(package, verification)
