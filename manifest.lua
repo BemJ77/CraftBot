@@ -1,6 +1,6 @@
 return {
     schema = 1,
-    managerVersion = "1.4.0",
+    managerVersion = "1.5.0",
     managerFiles = {
         "config/repository.lua",
         "config/settings.lua",
@@ -21,6 +21,7 @@ return {
         "ui/progress.lua",
         "ui/theme.lua",
         "manager.lua",
+        "update-manager.lua",
         "startup",
     },
     packages = {

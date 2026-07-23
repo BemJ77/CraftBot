@@ -11,7 +11,7 @@ local version = require("core.version")
 local logger = require("core.logger")
 local remote = require("core.remote")
 
-local MANAGER_VERSION = "1.4.0"
+local MANAGER_VERSION = "1.5.0"
 
 local function showResult(title, success, current, total, errors)
     local lines = {
@@ -315,11 +315,15 @@ local function packageActions(package)
     end
 end
 
-local function main()
-    logger.info("Demarrage CraftBot Manager " .. MANAGER_VERSION)
-
+local function synchronizePackages()
     local syncResult = remote.syncIndex(function(current, total, file, status)
-        progress.draw("SYNCHRONISATION GITHUB", current, total, file, status)
+        progress.draw(
+            "SYNCHRONISATION GITHUB",
+            current,
+            total,
+            file,
+            status
+        )
     end)
 
     if syncResult and syncResult.updated > 0 then
@@ -327,45 +331,142 @@ local function main()
         menu.message({
             title = "CATALOGUE ACTUALISE",
             lines = {
-                tostring(syncResult.updated) .. " paquet(s) disponible(s)",
+                tostring(syncResult.updated)
+                    .. " paquet(s) disponible(s)",
                 "",
                 "Les nouvelles versions sont disponibles."
             }
         })
-    elseif syncResult and #syncResult.errors > 0 then
-        logger.warn("Synchronisation GitHub ignoree : " .. tostring(syncResult.errors[1]))
+    elseif syncResult
+        and syncResult.errors
+        and #syncResult.errors > 0 then
+
+        logger.warn(
+            "Synchronisation GitHub ignoree : "
+                .. tostring(syncResult.errors[1])
+        )
     end
+end
+
+-- Contenu identique au menu principal de la version 1.4.0.
+local function packageMenu()
+    synchronizePackages()
 
     while true do
         local packages, errors = packageManager.discover()
+
         if #packages == 0 then
-            menu.message({ title = "AUCUN PAQUET", lines = { errors[1] or "Aucun paquet valide" } })
+            menu.message({
+                title = "AUCUN PAQUET",
+                lines = {
+                    errors[1] or "Aucun paquet valide"
+                }
+            })
             return
         end
 
         local labels = {}
+
         for _, package in ipairs(packages) do
             local state = installed.getState(package)
-            local suffix = state.samePackage and (" [INSTALLE " .. tostring(state.marker.version) .. "]") or ""
-            labels[#labels + 1] = package.name .. "  v" .. package.version .. suffix
+            local suffix = state.samePackage
+                and (
+                    " [INSTALLE "
+                    .. tostring(state.marker.version)
+                    .. "]"
+                )
+                or ""
+
+            labels[#labels + 1] =
+                package.name
+                .. "  v"
+                .. package.version
+                .. suffix
         end
-        labels[#labels + 1] = "Quitter"
+
+        labels[#labels + 1] = "Retour"
 
         local choice = menu.select({
-            title = "CRAFTBOT MANAGER",
-            subtitle = "Version " .. MANAGER_VERSION,
+            title = "INSTALLER UN PACKAGE",
+            subtitle = "Manager " .. MANAGER_VERSION,
             items = labels
         })
 
         if choice == #labels then
-            term.setBackgroundColor(colors.black)
-            term.setTextColor(colors.white)
-            term.clear()
-            term.setCursorPos(1, 1)
             return
         end
 
         packageActions(packages[choice])
+    end
+end
+
+local function updateManager()
+    if not fs.exists("/update-manager.lua") then
+        menu.message({
+            title = "MISE A JOUR IMPOSSIBLE",
+            lines = {
+                "Le fichier /update-manager.lua est absent.",
+                "",
+                "Relance l'installation legere une fois."
+            }
+        })
+        return
+    end
+
+    local ok, updateError = pcall(function()
+        shell.run(
+            "/update-manager.lua",
+            MANAGER_VERSION
+        )
+    end)
+
+    if not ok then
+        logger.error(
+            "Mise a jour Manager impossible : "
+                .. tostring(updateError)
+        )
+
+        menu.message({
+            title = "MISE A JOUR IMPOSSIBLE",
+            lines = {
+                tostring(updateError)
+            }
+        })
+    end
+end
+
+local function clearScreen()
+    term.setBackgroundColor(colors.black)
+    term.setTextColor(colors.white)
+    term.clear()
+    term.setCursorPos(1, 1)
+end
+
+local function main()
+    logger.info(
+        "Demarrage CraftBot Manager "
+            .. MANAGER_VERSION
+    )
+
+    while true do
+        local choice = menu.select({
+            title = "CRAFTBOT MANAGER",
+            subtitle = "Version " .. MANAGER_VERSION,
+            items = {
+                "Installer un package",
+                "Mettre a jour le Manager",
+                "Quitter"
+            }
+        })
+
+        if choice == 1 then
+            packageMenu()
+        elseif choice == 2 then
+            updateManager()
+        else
+            clearScreen()
+            return
+        end
     end
 end
 
