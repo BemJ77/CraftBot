@@ -11,7 +11,7 @@ local version = require("core.version")
 local logger = require("core.logger")
 local remote = require("core.remote")
 
-local MANAGER_VERSION = "1.5.1"
+local MANAGER_VERSION = "1.5.2"
 
 local function showResult(title, success, current, total, errors)
     local lines = {
@@ -193,54 +193,95 @@ end
 
 local function updatePackage(package)
     local state = installed.getState(package)
+
     if not state.samePackage then
-        menu.message({ title = "MISE A JOUR", lines = { "Ce paquet n'est pas installe" } })
+        menu.message({
+            title = "MISE A JOUR",
+            lines = { "Ce paquet n'est pas installe" }
+        })
         return
     end
 
     while true do
-        local updateAvailable = version.compare(package.version, state.marker.version) > 0
+        local updateAvailable =
+            version.compare(package.version, state.marker.version) > 0
+
         local items = {}
-        if updateAvailable then items[#items + 1] = "Mettre a jour" end
+
+        if updateAvailable then
+            items[#items + 1] = "Mettre a jour"
+        end
+
         items[#items + 1] = "Changelog"
         items[#items + 1] = "Retour"
 
         local choice = menu.select({
             title = "MISE A JOUR " .. string.upper(package.name),
-            subtitle = "Actuelle " .. tostring(state.marker.version) .. "  |  Disponible " .. package.version,
+            subtitle =
+                "Actuelle "
+                .. tostring(state.marker.version)
+                .. "  |  Disponible "
+                .. package.version,
             items = items
         })
 
-        if choice == #items then return end
+        if choice == #items then
+            return
+        end
 
         if updateAvailable and choice == 1 then
             if menu.confirm({
                 title = "CONFIRMER LA MISE A JOUR",
-                subtitle = tostring(state.marker.version) .. " -> " .. package.version,
+                subtitle =
+                    tostring(state.marker.version)
+                    .. " -> "
+                    .. package.version,
                 yesText = "Oui",
                 noText = "Non"
             }) then
-                -- Télécharge d'abord la nouvelle version complète du package.
                 package = downloadFullPackage(package)
 
                 if not package then
                     return
                 end
 
-            local result = updater.run(
-                package,
-                state.marker,
-                MANAGER_VERSION,
-                function(current, total, file, status)
-                    progress.draw(
-                        "MISE A JOUR " .. string.upper(package.name),
-                        current,
-                        total,
-                        file,
-                        status
-                    )
+                local result = updater.run(
+                    package,
+                    state.marker,
+                    MANAGER_VERSION,
+                    function(current, total, file, status)
+                        progress.draw(
+                            "MISE A JOUR "
+                                .. string.upper(package.name),
+                            current,
+                            total,
+                            file,
+                            status
+                        )
+                    end
+                )
+
+                sleep(0.4)
+
+                showResult(
+                    "MISE A JOUR",
+                    result.success,
+                    result.copied,
+                    result.total,
+                    result.errors
+                )
+
+                if result.success then
+                    askReboot(package.name)
+                    return
                 end
-            )
+            end
+        else
+            menu.message({
+                title = "CHANGELOG " .. string.upper(package.name),
+                lines = changelogLines(package)
+            })
+        end
     end
 end
 

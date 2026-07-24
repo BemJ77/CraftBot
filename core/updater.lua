@@ -80,15 +80,21 @@ function updater.run(package, marker, managerVersion, onProgress)
             onProgress(result.copied, result.total, file.displayPath, "Mise a jour")
         end
 
+        logger.info("SOURCE      : " .. file.sourcePath)
+        logger.info("DESTINATION : " .. file.destinationPath)
         local ok, err = filesystem.copyFile(file.sourcePath, file.destinationPath)
         local hash = nil
-        if ok then ok, hash = verifyCopy(file) end
+        if ok then 
+            ok, hash = verifyCopy(file)
+            logger.info("COPIE OK : " .. file.destinationPath)
+         end
 
         if ok then
             result.copied = result.copied + 1
             installedFiles[#installedFiles + 1] = file.destinationPath
             installedChecksums[file.destinationPath] = hash
         else
+            logger.error("ECHEC COPIE : " .. tostring(err))
             result.errors[#result.errors + 1] = file.destinationPath .. " : " .. tostring(hash or err)
         end
     end
