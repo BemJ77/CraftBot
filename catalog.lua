@@ -1,6 +1,6 @@
 return {
     schema = 1,
-    generated = "2026-07-24T10:41:49+00:00",
+    generated = "2026-07-24T10:57:22+00:00",
     packages = {
         {
             folder = "borne",

@@ -11,7 +11,7 @@ local version = require("core.version")
 local logger = require("core.logger")
 local remote = require("core.remote")
 
-local MANAGER_VERSION = "1.5.0"
+local MANAGER_VERSION = "1.5.1"
 
 local function showResult(title, success, current, total, errors)
     local lines = {

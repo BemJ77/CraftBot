@@ -1,6 +1,6 @@
 return {
     schema = 1,
-    managerVersion = "1.5.0",
+    managerVersion = "1.5.1",
     managerFiles = {
         "config/repository.lua",
         "config/settings.lua",
