@@ -1,0 +1,27 @@
+local items = require("items")
+ 
+return {
+    id = "donutsprinkles",
+    label = "Donut aux Éclats",
+
+    visible = true,
+    category = "dessert",
+
+    output = items.donutsprinkles,
+    outputCount = 1,
+ 
+    ingredients = {
+        [1] = items.pot,
+        [2] = items.huile,
+        [3] = items.sucre,
+        [5] = items.pate,
+        [6] = items.dyerouge,
+        [7] = items.dyevert,
+        [9] = items.dyejaune,
+        [10] = items.dyebleu,
+    },
+
+	returns = {
+        items.pot
+    }
+}

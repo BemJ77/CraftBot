@@ -5,7 +5,7 @@ return {
     label = "frite",
  
     visible = true,
-    category = "side",
+    category = "accompagnement",
 
     output = items.frite,
     outputCount = 1,

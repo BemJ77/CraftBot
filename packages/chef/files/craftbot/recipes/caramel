@@ -1,0 +1,21 @@
+local items = require("items")
+ 
+return {
+    id = "caramel",
+    label = "caramel",
+ 
+    visible = false,
+
+    output = items.caramel,
+    outputCount = 1,
+ 
+    ingredients = {
+        [1] = items.saucepan,
+        [2] = items.sucre,
+        [3] = items.lait,
+    },
+
+	returns = {
+        items.saucepan
+    }
+}

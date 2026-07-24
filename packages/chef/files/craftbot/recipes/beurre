@@ -1,0 +1,20 @@
+local items = require("items")
+ 
+return {
+    id = "beurre",
+    label = "Beurre",
+ 
+    visible = false,
+
+    output = items.beurre,
+    outputCount = 1,
+ 
+    ingredients = {
+        [1] = items.pot,
+        [2] = items.lait,
+    },
+
+	returns = {
+        items.pot
+    }
+}

@@ -1,7 +1,7 @@
 return {
     id = "craftbot.chef",
     name = "Chef",
-    version = "7.1.1",
+    version = "7.2.0",
     author = "Benjamin",
     description = "Execute les recettes CraftBot avec une Turtle.",
     category = "Turtle",
