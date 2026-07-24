@@ -5,6 +5,11 @@ local CURRENT_VERSION = tostring(({ ... })[1] or "0.0.0")
 local CONFIG_PATH = "/config/repository.lua"
 local TEMP_ROOT = "/downloads/manager-update"
 
+local PROTECTED_FILES = {
+    ["startup"] = true,
+    ["config/repository.lua"] = true
+}
+
 local function clear()
     term.setBackgroundColor(colors.black)
     term.setTextColor(colors.white)
@@ -211,9 +216,10 @@ local function downloadManagerFiles(base, files)
                 "Chemin Manager invalide dans manifest.lua"
         end
 
-        -- La configuration du depot appartient a la machine.
-        -- Elle n'est donc pas remplacee pendant une mise a jour.
-        if relative ~= "config/repository.lua" then
+        -- Certains fichiers appartiennent a la machine ou au package actif.
+        -- Ils restent presents dans le manifeste pour l'installation initiale,
+        -- mais ne sont jamais remplaces pendant une mise a jour du Manager.
+        if not PROTECTED_FILES[relative] then
             clear()
             print("MISE A JOUR CRAFTBOT MANAGER")
             print("")
@@ -259,7 +265,7 @@ local function installManagerFiles(files)
     }
 
     local function installOne(relative)
-        if relative == "config/repository.lua" then
+        if PROTECTED_FILES[relative] then
             return true
         end
 
