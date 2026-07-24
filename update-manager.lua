@@ -452,6 +452,14 @@ local function main()
         ] = "update-manager.lua"
     end
 
+    print("=== FICHIERS A INSTALLER ===")
+
+    for _, file in ipairs(manifest.managerFiles) do
+        print(file, PROTECTED_FILES[file] and "(PROTEGE)" or "")
+    end
+
+    sleep(5)
+
     local installed, installError =
         installManagerFiles(manifest.managerFiles)
 
