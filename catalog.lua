@@ -1,7 +1,7 @@
 return {
-    schema = 1,
-    generated = "2026-07-22",
+    generated = "2026-07-24",
     packages = {
+
         {
             folder = "borne",
             version = "7.1.1",
@@ -18,9 +18,10 @@ return {
                 "package.lua",
             }
         },
+
         {
             folder = "chef",
-            version = "7.1.1",
+            version = "7.2.0",
             files = {
                 "changelog.lua",
                 "files/craftbot/ae",
@@ -35,13 +36,23 @@ return {
                 "files/craftbot/recipeManager",
                 "files/craftbot/recipes/bacon",
                 "files/craftbot/recipes/baconcheeseburger",
+                "files/craftbot/recipes/beurre",
                 "files/craftbot/recipes/burger",
                 "files/craftbot/recipes/burgervegan",
                 "files/craftbot/recipes/cacao",
+                "files/craftbot/recipes/caramel",
                 "files/craftbot/recipes/cheeseburger",
                 "files/craftbot/recipes/coca",
                 "files/craftbot/recipes/deluxeburger",
+                "files/craftbot/recipes/donutcaramel",
+                "files/craftbot/recipes/donutcarotte",
                 "files/craftbot/recipes/donutchoco",
+                "files/craftbot/recipes/donutcitrouille",
+                "files/craftbot/recipes/donutglace",
+                "files/craftbot/recipes/donutmiel",
+                "files/craftbot/recipes/donutpomme",
+                "files/craftbot/recipes/donutsprinkles",
+                "files/craftbot/recipes/donutsucre",
                 "files/craftbot/recipes/farine",
                 "files/craftbot/recipes/firmtofu",
                 "files/craftbot/recipes/frite",
@@ -63,6 +74,7 @@ return {
                 "package.lua",
             }
         },
+
         {
             folder = "moniteur",
             version = "7.1.1",
@@ -75,6 +87,7 @@ return {
                 "package.lua",
             }
         },
+
         {
             folder = "server",
             version = "7.1.1",
@@ -88,5 +101,6 @@ return {
                 "package.lua",
             }
         },
+
     }
 }
