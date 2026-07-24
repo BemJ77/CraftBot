@@ -32,7 +32,15 @@ end
 
 local function download(url, destination)
     if not http or not http.get then return false, "API HTTP indisponible" end
-    local response, err = http.get(url, nil, true)
+    local separator = url:find("?", 1, true) and "&" or "?"
+    local cacheKey = tostring(
+        os.epoch and os.epoch("utc")
+        or math.floor(os.clock() * 1000)
+    )
+
+    local freshUrl = url .. separator .. "cache=" .. cacheKey
+
+    local response, err = http.get(freshUrl, nil, true)
     if not response then return false, tostring(err or "Telechargement impossible") end
     local data = response.readAll()
     response.close()
