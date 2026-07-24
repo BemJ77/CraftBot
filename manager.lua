@@ -220,21 +220,27 @@ local function updatePackage(package)
                 yesText = "Oui",
                 noText = "Non"
             }) then
-                local result = updater.run(package, state.marker, MANAGER_VERSION, function(current, total, file, status)
-                    progress.draw("MISE A JOUR " .. string.upper(package.name), current, total, file, status)
-                end)
-                sleep(0.4)
-                showResult("MISE A JOUR", result.success, result.copied, result.total, result.errors)
-                if result.success then askReboot(package.name) end
-                return
-            end
-        else
-            menu.list({
-                title = "CHANGELOG " .. string.upper(package.name),
-                subtitle = "Derniere version : " .. package.version,
-                items = changelogLines(package)
-            })
-        end
+                -- Télécharge d'abord la nouvelle version complète du package.
+                package = downloadFullPackage(package)
+
+                if not package then
+                    return
+                end
+
+            local result = updater.run(
+                package,
+                state.marker,
+                MANAGER_VERSION,
+                function(current, total, file, status)
+                    progress.draw(
+                        "MISE A JOUR " .. string.upper(package.name),
+                        current,
+                        total,
+                        file,
+                        status
+                    )
+                end
+            )
     end
 end
 

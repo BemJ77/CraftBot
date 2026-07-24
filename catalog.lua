@@ -1,7 +1,7 @@
 return {
-    generated = "2026-07-24",
+    schema = 1,
+    generated = "2026-07-24T10:41:49+00:00",
     packages = {
-
         {
             folder = "borne",
             version = "7.1.1",
@@ -16,12 +16,11 @@ return {
                 "files/borne/workers",
                 "files/startup",
                 "package.lua",
-            }
+            },
         },
-
         {
             folder = "chef",
-            version = "7.2.0",
+            version = "7.2.2",
             files = {
                 "changelog.lua",
                 "files/craftbot/ae",
@@ -72,9 +71,8 @@ return {
                 "files/craftbot/test",
                 "files/startup",
                 "package.lua",
-            }
+            },
         },
-
         {
             folder = "moniteur",
             version = "7.1.1",
@@ -85,9 +83,8 @@ return {
                 "files/moniteur/monitor",
                 "files/startup",
                 "package.lua",
-            }
+            },
         },
-
         {
             folder = "server",
             version = "7.1.1",
@@ -99,8 +96,7 @@ return {
                 "files/craftbot/server",
                 "files/startup",
                 "package.lua",
-            }
+            },
         },
-
-    }
+    },
 }
