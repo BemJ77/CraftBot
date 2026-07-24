@@ -11,7 +11,7 @@ local version = require("core.version")
 local logger = require("core.logger")
 local remote = require("core.remote")
 
-local MANAGER_VERSION = "1.5.2"
+local MANAGER_VERSION = "1.5.3"
 
 local function showResult(title, success, current, total, errors)
     local lines = {
@@ -193,57 +193,35 @@ end
 
 local function updatePackage(package)
     local state = installed.getState(package)
-
     if not state.samePackage then
-        menu.message({
-            title = "MISE A JOUR",
-            lines = { "Ce paquet n'est pas installe" }
-        })
+        menu.message({ title = "MISE A JOUR", lines = { "Ce paquet n'est pas installe" } })
         return
     end
 
     while true do
-        local updateAvailable =
-            version.compare(package.version, state.marker.version) > 0
-
+        local updateAvailable = version.compare(package.version, state.marker.version) > 0
         local items = {}
-
-        if updateAvailable then
-            items[#items + 1] = "Mettre a jour"
-        end
-
+        if updateAvailable then items[#items + 1] = "Mettre a jour" end
         items[#items + 1] = "Changelog"
         items[#items + 1] = "Retour"
 
         local choice = menu.select({
             title = "MISE A JOUR " .. string.upper(package.name),
-            subtitle =
-                "Actuelle "
-                .. tostring(state.marker.version)
-                .. "  |  Disponible "
-                .. package.version,
+            subtitle = "Actuelle " .. tostring(state.marker.version) .. "  |  Disponible " .. package.version,
             items = items
         })
 
-        if choice == #items then
-            return
-        end
+        if choice == #items then return end
 
         if updateAvailable and choice == 1 then
             if menu.confirm({
                 title = "CONFIRMER LA MISE A JOUR",
-                subtitle =
-                    tostring(state.marker.version)
-                    .. " -> "
-                    .. package.version,
+                subtitle = tostring(state.marker.version) .. " -> " .. package.version,
                 yesText = "Oui",
                 noText = "Non"
             }) then
                 package = downloadFullPackage(package)
-
-                if not package then
-                    return
-                end
+                if not package then return end
 
                 local result = updater.run(
                     package,
@@ -251,8 +229,7 @@ local function updatePackage(package)
                     MANAGER_VERSION,
                     function(current, total, file, status)
                         progress.draw(
-                            "MISE A JOUR "
-                                .. string.upper(package.name),
+                            "MISE A JOUR " .. string.upper(package.name),
                             current,
                             total,
                             file,
@@ -262,14 +239,7 @@ local function updatePackage(package)
                 )
 
                 sleep(0.4)
-
-                showResult(
-                    "MISE A JOUR",
-                    result.success,
-                    result.copied,
-                    result.total,
-                    result.errors
-                )
+                showResult("MISE A JOUR", result.success, result.copied, result.total, result.errors)
 
                 if result.success then
                     askReboot(package.name)
@@ -277,9 +247,10 @@ local function updatePackage(package)
                 end
             end
         else
-            menu.message({
+            menu.list({
                 title = "CHANGELOG " .. string.upper(package.name),
-                lines = changelogLines(package)
+                subtitle = "Derniere version : " .. package.version,
+                items = changelogLines(package)
             })
         end
     end
@@ -489,6 +460,53 @@ local function clearScreen()
     term.setCursorPos(1, 1)
 end
 
+local function getDashboardSubtitle()
+    local lines = {
+        { text = "Version " .. MANAGER_VERSION, color = colors.lightGray }
+    }
+
+    local packages = packageManager.discover()
+    local activePackage = nil
+    local activeState = nil
+
+    for _, package in ipairs(packages) do
+        local state = installed.getState(package)
+
+        if state.samePackage then
+            activePackage = package
+            activeState = state
+            break
+        end
+    end
+
+    lines[#lines + 1] = { text = "", color = colors.white }
+
+    if not activePackage then
+        lines[#lines + 1] = {
+            text = "Package actif : Aucun",
+            color = colors.red
+        }
+        return lines
+    end
+
+    lines[#lines + 1] = {
+        text = "Package actif : "
+            .. activePackage.name
+            .. " v"
+            .. tostring(activeState.marker.version),
+        color = colors.lime
+    }
+
+    if version.compare(activePackage.version, activeState.marker.version) > 0 then
+        lines[#lines + 1] = {
+            text = "Mise a jour disponible : v" .. tostring(activePackage.version),
+            color = colors.yellow
+        }
+    end
+
+    return lines
+end
+
 local function main()
     logger.info(
         "Demarrage CraftBot Manager "
@@ -498,10 +516,11 @@ local function main()
     while true do
         local choice = menu.select({
             title = "CRAFTBOT MANAGER",
-            subtitle = "Version " .. MANAGER_VERSION,
+            subtitle = getDashboardSubtitle(),
             items = {
                 "Installer un package",
                 "Mettre a jour le Manager",
+                "Redemarrer",
                 "Quitter"
             }
         })
@@ -510,6 +529,16 @@ local function main()
             packageMenu()
         elseif choice == 2 then
             updateManager()
+        elseif choice == 3 then
+            if menu.confirm({
+                title = "REDEMARRAGE",
+                subtitle = "Redemarrer l'ordinateur ?",
+                yesText = "Oui",
+                noText = "Non"
+            }) then
+                clearScreen()
+                os.reboot()
+            end
         else
             clearScreen()
             return

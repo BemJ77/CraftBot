@@ -21,9 +21,28 @@ end
 local function drawHeader(title, subtitle)
     centerText(2, title, theme.title)
 
+    if type(subtitle) == "table" then
+        local y = 3
+
+        for _, line in ipairs(subtitle) do
+            if type(line) == "table" then
+                centerText(y, line.text or "", line.color or theme.subtitle)
+            else
+                centerText(y, line, theme.subtitle)
+            end
+
+            y = y + 1
+        end
+
+        return y
+    end
+
     if subtitle then
         centerText(3, subtitle, theme.subtitle)
+        return 4
     end
+
+    return 3
 end
 
 function menu.select(options)
@@ -33,11 +52,11 @@ function menu.select(options)
 
     while true do
         clearScreen()
-        drawHeader(options.title or "MENU", options.subtitle)
+        local headerEndY = drawHeader(options.title or "MENU", options.subtitle)
 
         local width, height = term.getSize()
-        local startY = 6
-        local visibleRows = math.max(1, height - 8)
+        local startY = math.max(6, headerEndY + 1)
+        local visibleRows = math.max(1, height - startY - 2)
 
         if selected <= offset then
             offset = selected - 1
@@ -89,11 +108,14 @@ end
 
 function menu.message(options)
     clearScreen()
-    drawHeader(options.title or "INFORMATION", options.subtitle)
+    local headerEndY = drawHeader(options.title or "INFORMATION", options.subtitle)
 
     local lines = options.lines or {}
     local _, height = term.getSize()
-    local startY = math.max(6, math.floor((height - #lines) / 2))
+    local startY = math.max(
+        math.max(6, headerEndY + 1),
+        math.floor((height - #lines) / 2)
+    )
 
     for index, line in ipairs(lines) do
         centerText(
@@ -152,11 +174,11 @@ function menu.list(options)
 
     while true do
         clearScreen()
-        drawHeader(options.title or "LISTE", options.subtitle)
+        local headerEndY = drawHeader(options.title or "LISTE", options.subtitle)
 
         local width, height = term.getSize()
-        local startY = 6
-        local visibleRows = math.max(1, height - 8)
+        local startY = math.max(6, headerEndY + 1)
+        local visibleRows = math.max(1, height - startY - 2)
 
         if selected <= offset then
             offset = selected - 1
