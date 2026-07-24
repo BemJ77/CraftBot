@@ -2,7 +2,7 @@ local items = require("items")
  
 return {
     id = "donutglace",
-    label = "Donut Glacé",
+    label = "Donut Glace",
  
     visible = true,
     category = "dessert",
